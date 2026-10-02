@@ -64,6 +64,10 @@ doc/
 identity.key
 **/identity.key
 
+# SSH provider's project-local private state and logs
+**/.buzz-ssh-provider/
+__pycache__/
+
 # Claude Code worktrees
 .claude/worktrees/
 

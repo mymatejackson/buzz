@@ -52,6 +52,12 @@ pub(crate) fn is_dev_data_dir_name(name: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('.'))
 }
 
+/// A named demo has its own app data, nest, and Keychain service. Even if a
+/// future config uses a dev-shaped identifier, it must never import live data.
+fn should_import_existing_user_state(is_dev: bool, is_demo: bool) -> bool {
+    is_dev && !is_demo
+}
+
 fn canonical_dev_data_dir(current: &Path) -> Option<PathBuf> {
     current.parent().map(|p| p.join(CANONICAL_DEV_IDENTIFIER))
 }
@@ -143,12 +149,15 @@ fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
         false
     };
 
+    let import_existing_user_state =
+        should_import_existing_user_state(is_dev, crate::build_identity::is_demo_build());
+
     // On dev builds, copy `.repos-dir` from ~/.buzz → ~/.buzz-dev before
     // resolve_repos_at_boot() reads it. Skip-if-dest-exists so it is idempotent
     // and never clobbers a value the dev nest already set explicitly.
     // The composed helper keeps gate + migration on the tested code path.
     if let (Some(home), Some(dev_nest)) = (dirs::home_dir(), crate::managed_agents::nest_dir()) {
-        maybe_migrate_dev_repos_dir(is_dev, reset_completed, &home, &dev_nest);
+        maybe_migrate_dev_repos_dir(import_existing_user_state, reset_completed, &home, &dev_nest);
     }
 
     if !crate::build_identity::is_demo_build() {
@@ -162,7 +171,7 @@ fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
     // any load_managed_agents call (which runs hydrate_keys against the
     // dev service and would log "has no key" for un-migrated entries).
     #[cfg(debug_assertions)]
-    if is_dev {
+    if import_existing_user_state {
         crate::managed_agents::migrate_agent_keys_to_dev_service(app);
     }
     migrate_persona_provider_to_runtime(app);

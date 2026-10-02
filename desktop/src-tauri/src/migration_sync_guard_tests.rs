@@ -1,5 +1,13 @@
 use super::*;
 
+#[test]
+fn named_demo_never_imports_production_state_even_with_a_dev_shaped_identifier() {
+    assert!(!should_import_existing_user_state(true, true));
+    assert!(!should_import_existing_user_state(false, true));
+    assert!(should_import_existing_user_state(true, false));
+    assert!(!should_import_existing_user_state(false, false));
+}
+
 // ── is_dev_data_dir_name predicate ──────────────────────────────────────────
 
 #[test]

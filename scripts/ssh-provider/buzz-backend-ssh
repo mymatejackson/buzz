@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""Buzz provider protocol v1: SSH to a native macOS launchd job.
+
+One staged file is intentional: Buzz copies only the provider executable before
+calling info and deploy. No credential or machine setting is bundled here.
+"""
+import base64
+import json
+import re
+import shlex
+import subprocess
+import sys
+
+REMOTE = r'''
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from urllib.parse import urlparse
+
+ALPHABET = "023456789acdefghjklmnpqrstuvwxyz"
+FIELD = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+GX = 55066263022277343669578718895168534326250603453777594175500187360389116729240
+GY = 32670510020758816978083085130507043184471273380659243275938904335757337482424
+RESERVED = {"BUZZ_RELAY_URL", "BUZZ_PRIVATE_KEY", "NOSTR_PRIVATE_KEY",
+            "BUZZ_AUTH_TAG", "BUZZ_ACP_AGENT_OWNER", "BUZZ_ACP_AGENT_COMMAND",
+            "BUZZ_ACP_AGENT_ARGS", "BUZZ_ACP_RESPOND_TO",
+            "BUZZ_ACP_RESPOND_TO_ALLOWLIST", "BUZZ_ACP_MCP_COMMAND",
+            "BUZZ_ACP_EXIT_AFTER_INACTIVITY", "BUZZ_MANAGED_AGENT_START_NONCE"}
+ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+HEX64 = re.compile(r"[0-9a-fA-F]{64}\Z")
+LABEL = re.compile(r"local\.buzz\.ssh\.[0-9a-f]{20}\Z")
+
+def fail(message):
+    raise ValueError(message)
+
+def decode_nsec(value):
+    if not isinstance(value, str) or value.lower() != value or not value.startswith("nsec1"):
+        fail("invalid agent identity")
+    data = [ALPHABET.find(c) for c in value[5:]]
+    if len(data) < 7 or min(data) < 0:
+        fail("invalid agent identity")
+    chk = 1
+    for n in [3, 3, 3, 3, 0, 14, 19, 5, 3] + data:
+        top = chk >> 25
+        chk = ((chk & 0x1ffffff) << 5) ^ n
+        for i, gen in enumerate((0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3)):
+            if (top >> i) & 1:
+                chk ^= gen
+    if chk != 1:
+        fail("invalid agent identity")
+    acc = bits = 0
+    raw = bytearray()
+    for n in data[:-6]:
+        acc = (acc << 5) | n
+        bits += 5
+        if bits >= 8:
+            bits -= 8
+            raw.append((acc >> bits) & 255)
+    if len(raw) != 32 or bits >= 5 or ((acc << (8 - bits)) & 255):
+        fail("invalid agent identity")
+    scalar = int.from_bytes(raw, "big")
+    if not 1 <= scalar < 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141:
+        fail("invalid agent identity")
+    return scalar
+
+def pubkey(scalar):
+    def add(a, b):
+        if a is None:
+            return b
+        if b is None:
+            return a
+        if a[0] == b[0] and (a[1] + b[1]) % FIELD == 0:
+            return None
+        slope = ((3 * a[0] * a[0]) * pow(2 * a[1], -1, FIELD)
+                 if a == b else (b[1] - a[1]) * pow((b[0] - a[0]) % FIELD, -1, FIELD)) % FIELD
+        x = (slope * slope - a[0] - b[0]) % FIELD
+        return x, (slope * (a[0] - x) - a[1]) % FIELD
+    result = None
+    point = GX, GY
+    while scalar:
+        if scalar & 1:
+            result = add(result, point)
+        point = add(point, point)
+        scalar >>= 1
+    return f"{result[0]:064x}"
+
+def safe_root(value):
+    if not isinstance(value, str):
+        fail("remote_directory must be an absolute path")
+    path = Path(value)
+    if not path.is_absolute() or path.name != ".buzz-ssh-provider" or ".." in path.parts:
+        fail("remote_directory must end in .buzz-ssh-provider inside a project")
+    parent = path.parent
+    if not parent.is_dir() or parent.is_symlink() or parent.stat().st_uid != os.getuid():
+        fail("remote project directory must exist and belong to the SSH user")
+    if path.is_symlink():
+        fail("managed directory cannot be a symlink")
+    if path.exists():
+        if not path.is_dir() or path.stat().st_uid != os.getuid():
+            fail("managed directory is not owned by the SSH user")
+        if stat.S_IMODE(path.stat().st_mode) & 0o077:
+            fail("managed directory must have mode 0700")
+    return path
+
+def command(value, label, allow_absolute=False):
+    if allow_absolute and isinstance(value, str) and Path(value).is_absolute():
+        path = Path(value)
+        if not path.is_file() or not os.access(path, os.X_OK):
+            fail(label + " is unavailable on the remote host")
+        return str(path.resolve())
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.+-]*", value):
+        fail(label + " must be a command name on the remote PATH")
+    found = shutil.which(value)
+    if not found:
+        fail(label + " is unavailable on the remote PATH")
+    return str(Path(found).resolve())
+
+def env_for(agent, runtime):
+    nsec = agent.get("private_key_nsec")
+    key = pubkey(decode_nsec(nsec))
+    relay = agent.get("relay_url")
+    parsed = urlparse(relay if isinstance(relay, str) else "")
+    if parsed.scheme not in ("ws", "wss") or not parsed.netloc or parsed.username or parsed.password:
+        fail("relay_url must be a valid ws or wss URL")
+    launch = agent.get("launch")
+    if not isinstance(launch, dict):
+        fail("desktop-resolved launch data is required")
+    owner = launch.get("owner_pubkey")
+    if not isinstance(owner, str) or not HEX64.fullmatch(owner):
+        fail("launch.owner_pubkey is required for intentional stop")
+    if agent.get("provider", "").strip() == "relay-mesh":
+        fail("relay-mesh agents cannot be deployed to SSH")
+    merged = {}
+    for name in ("policy_env", "env"):
+        layer = launch.get(name, {})
+        if not isinstance(layer, dict):
+            fail("launch environment must be an object")
+        for k, v in layer.items():
+            if not isinstance(k, str) or not ENV_KEY.fullmatch(k) or not isinstance(v, str):
+                fail("launch environment contains an invalid entry")
+            if k.upper() == "BUZZ_ACP_NO_PRESENCE":
+                fail("presence suppression is forbidden for remote agents")
+        merged.update(layer)
+    for key_name in RESERVED:
+        merged.pop(key_name, None)
+    merged["BUZZ_RELAY_URL"] = relay
+    merged["BUZZ_PRIVATE_KEY"] = nsec
+    merged["NOSTR_PRIVATE_KEY"] = nsec
+    merged["BUZZ_ACP_AGENT_OWNER"] = owner.lower()
+    tag = agent.get("auth_tag")
+    if tag is not None:
+        if not isinstance(tag, str) or not tag.strip():
+            fail("auth_tag must be nonempty when supplied")
+        merged["BUZZ_AUTH_TAG"] = tag.strip()
+    agent_cmd = launch.get("command")
+    if agent_cmd:
+        merged["BUZZ_ACP_AGENT_COMMAND"] = command(agent_cmd, "launch.command")
+    args = launch.get("args", [])
+    if not isinstance(args, list) or any(not isinstance(a, str) or "," in a for a in args):
+        fail("launch.args must be strings without commas")
+    if args:
+        merged["BUZZ_ACP_AGENT_ARGS"] = ",".join(args)
+    mcp = shutil.which("buzz-dev-mcp")
+    if mcp:
+        merged["BUZZ_ACP_MCP_COMMAND"] = str(Path(mcp).resolve())
+    respond = agent.get("respond_to")
+    if respond is not None:
+        if respond not in ("owner-only", "allowlist", "anyone", "nobody"):
+            fail("invalid respond_to mode")
+        merged["BUZZ_ACP_RESPOND_TO"] = respond
+        if respond == "allowlist":
+            allow = agent.get("respond_to_allowlist")
+            if not isinstance(allow, list) or not allow or any(not isinstance(x, str) or not HEX64.fullmatch(x) for x in allow):
+                fail("respond_to_allowlist must contain public keys")
+            merged["BUZZ_ACP_RESPOND_TO_ALLOWLIST"] = ",".join(allow)
+    merged["BUZZ_ACP_EXIT_AFTER_INACTIVITY"] = "7200"
+    return key, merged
+
+def atomic(path, data, mode):
+    if path.is_symlink():
+        fail("managed path is a symlink")
+    temp = path.with_name(path.name + ".tmp." + str(os.getpid()))
+    fd = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temp, path)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
+def launchctl(*args):
+    return subprocess.run(["/bin/launchctl", *args], capture_output=True, text=True, timeout=15)
+
+def deploy(req):
+    cfg = req.get("provider_config")
+    agent = req.get("agent")
+    if not isinstance(cfg, dict) or not isinstance(agent, dict):
+        fail("deploy requires agent and provider_config objects")
+    if set(cfg) - {"host", "remote_directory", "runtime_command"}:
+        fail("unsupported provider configuration field")
+    root = safe_root(cfg.get("remote_directory"))
+    runtime = command(cfg.get("runtime_command", "buzz-acp"), "runtime_command", allow_absolute=True)
+    identity, env = env_for(agent, runtime)
+    relay = agent["relay_url"]
+    digest = hashlib.sha256((relay + "\0" + identity).encode()).hexdigest()[:20]
+    label = "local.buzz.ssh." + digest
+    domain = "gui/" + str(os.getuid())
+    domain_check = launchctl("print", domain)
+    if domain_check.returncode:
+        fail("launchd GUI domain is unavailable")
+    root.mkdir(mode=0o700, exist_ok=True)
+    state_dir = root / "state"
+    job_dir = root / "jobs"
+    log_dir = root / "logs"
+    work_dir = root / "work" / digest
+    for path in (state_dir, job_dir, log_dir, root / "work", work_dir):
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if path.is_symlink() or path.stat().st_uid != os.getuid() or stat.S_IMODE(path.stat().st_mode) & 0o077:
+            fail("managed subdirectory is unsafe")
+    lock = root / ("lock-" + digest)
+    if lock.is_symlink():
+        fail("managed lock is a symlink")
+    lock_fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(lock_fd, "rb+") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        state_path = state_dir / (digest + ".json")
+        plist_path = job_dir / (label + ".plist")
+        helper_path = root / "helper.py"
+        for path in (state_path, plist_path, helper_path):
+            if path.is_symlink():
+                fail("managed path is a symlink")
+        record = {"owner": "buzz-backend-ssh-v1", "label": label, "relay": relay,
+                  "pubkey": identity, "runtime": runtime, "env": env}
+        encoded = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+        fingerprint = hashlib.sha256(encoded).hexdigest()
+        if state_path.exists() and stat.S_IMODE(state_path.stat().st_mode) & 0o077:
+            fail("existing managed state is not private")
+        old = state_path.read_bytes() if state_path.exists() else None
+        old_plist = plist_path.read_bytes() if plist_path.exists() else None
+        if old:
+            try:
+                previous = json.loads(old)
+            except (ValueError, UnicodeDecodeError):
+                fail("existing managed state is unreadable")
+            if previous.get("owner") != "buzz-backend-ssh-v1" or previous.get("label") != label:
+                fail("existing managed state has a different owner")
+        status = launchctl("print", domain + "/" + label)
+        loaded = status.returncode == 0
+        running = loaded and "state = running" in status.stdout
+        if running:
+            if old and hashlib.sha256(old).hexdigest() == fingerprint:
+                return label
+            fail("agent is already running with different configuration; stop it before redeploy")
+        if loaded and launchctl("bootout", domain + "/" + label).returncode:
+            fail("could not unload stopped managed job")
+        source = globals().get("_SOURCE")
+        if not isinstance(source, bytes):
+            fail("remote helper source missing")
+        atomic(helper_path, source, 0o600)
+        atomic(state_path, encoded, 0o600)
+        plist = {"Label": label, "ProgramArguments": [sys.executable, str(helper_path),
+                 "run", str(root), digest], "WorkingDirectory": str(work_dir),
+                 "RunAtLoad": True, "KeepAlive": False, "ProcessType": "Background"}
+        atomic(plist_path, plistlib.dumps(plist), 0o600)
+        try:
+            if launchctl("bootstrap", domain, str(plist_path)).returncode:
+                fail("launchd could not bootstrap the managed job")
+            verified = launchctl("print", domain + "/" + label)
+            if verified.returncode:
+                fail("launchd did not retain the managed job")
+        except Exception:
+            launchctl("bootout", domain + "/" + label)
+            if old is None:
+                state_path.unlink(missing_ok=True)
+            else:
+                atomic(state_path, old, 0o600)
+            if old_plist is None:
+                plist_path.unlink(missing_ok=True)
+            else:
+                atomic(plist_path, old_plist, 0o600)
+            raise
+    return label
+
+def run(root_value, digest):
+    if not re.fullmatch(r"[0-9a-f]{20}", digest):
+        fail("invalid managed id")
+    root = safe_root(root_value)
+    for directory in (root / "state", root / "logs", root / "work", root / "work" / digest):
+        if directory.is_symlink() or not directory.is_dir() or directory.stat().st_uid != os.getuid() or stat.S_IMODE(directory.stat().st_mode) & 0o077:
+            fail("managed subdirectory is unsafe")
+    state = root / "state" / (digest + ".json")
+    if state.is_symlink() or not state.is_file() or state.stat().st_uid != os.getuid() or stat.S_IMODE(state.stat().st_mode) & 0o077:
+        fail("managed state is missing or unsafe")
+    record = json.loads(state.read_text())
+    if record.get("owner") != "buzz-backend-ssh-v1" or record.get("label") != "local.buzz.ssh." + digest:
+        fail("managed state ownership mismatch")
+    log_path = root / "logs" / (digest + ".log")
+    if log_path.is_symlink() or (log_path.exists() and (log_path.stat().st_uid != os.getuid() or stat.S_IMODE(log_path.stat().st_mode) & 0o077)):
+        fail("managed log is unsafe")
+    fd = os.open(log_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    os.close(fd)
+    os.chdir(root / "work" / digest)
+    os.execve(record["runtime"], [record["runtime"]], {**os.environ, **record["env"]})
+
+def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "run":
+        if len(sys.argv) != 4:
+            fail("invalid run arguments")
+        run(sys.argv[2], sys.argv[3])
+        return
+    req = json.load(sys.stdin)
+    if not isinstance(req, dict) or req.get("op") != "deploy":
+        fail("unsupported remote operation")
+    print(json.dumps({"ok": True, "agent_id": deploy(req)}, separators=(",", ":")))
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        # Neither the exception nor subprocess stderr is returned: both can contain secrets.
+        print(json.dumps({"ok": False, "error": str(exc) if isinstance(exc, ValueError) else "remote deployment failed"}))
+'''
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "host": {"type": "string", "title": "SSH host alias",
+                 "description": "An existing SSH alias with trusted host key and working BatchMode authentication."},
+        "remote_directory": {"type": "string", "title": "Remote managed directory",
+                             "description": "Absolute project path ending in .buzz-ssh-provider; created mode 0700."},
+        "runtime_command": {"type": "string", "title": "Remote Buzz runtime",
+                            "description": "Executable name on the remote PATH, or an absolute executable path on that host.", "default": "buzz-acp"}
+    },
+    "required": ["host", "remote_directory"]
+}
+BOOT = "import sys,base64;src=base64.b64decode(sys.stdin.buffer.readline());exec(compile(src,'<buzz-ssh-helper>','exec'),{'__name__':'__main__','_SOURCE':src})"
+
+def respond(request):
+    if not isinstance(request, dict):
+        return {"ok": False, "error": "request must be an object"}
+    if request.get("op") == "info":
+        return {"ok": True, "name": "ssh", "version": "0.1.0",
+                "protocol_version": 1,
+                "description": "Prototype: native macOS agent over existing SSH and launchd",
+                "config_schema": SCHEMA}
+    if request.get("op") != "deploy":
+        return {"ok": False, "error": "unsupported operation"}
+    config = request.get("provider_config")
+    if not isinstance(config, dict) or set(config) - set(SCHEMA["properties"]):
+        return {"ok": False, "error": "invalid provider configuration"}
+    host = config.get("host")
+    if not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", host):
+        return {"ok": False, "error": "host must be an SSH alias"}
+    if not isinstance(request.get("agent"), dict):
+        return {"ok": False, "error": "agent payload is required"}
+    remote_command = "python3 -c " + shlex.quote(BOOT)
+    argv = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "NumberOfPasswordPrompts=0",
+            "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10",
+            "--", host, remote_command]
+    wire = base64.b64encode(REMOTE.encode()) + b"\n" + json.dumps(request, separators=(",", ":")).encode()
+    try:
+        result = subprocess.run(argv, input=wire, capture_output=True, timeout=90)
+    except (OSError, subprocess.TimeoutExpired):
+        return {"ok": False, "error": "SSH transport failed; check host trust, authentication and reachability"}
+    if result.returncode or len(result.stdout) > 65536:
+        return {"ok": False, "error": "SSH deployment failed; check remote Python and launchd availability"}
+    try:
+        response = json.loads(result.stdout)
+    except (UnicodeDecodeError, ValueError):
+        return {"ok": False, "error": "remote helper returned an invalid response"}
+    if not isinstance(response, dict) or not isinstance(response.get("ok"), bool):
+        return {"ok": False, "error": "remote helper returned an invalid response"}
+    if response["ok"]:
+        agent_id = response.get("agent_id")
+        if not isinstance(agent_id, str) or not re.fullmatch(r"local\.buzz\.ssh\.[0-9a-f]{20}", agent_id):
+            return {"ok": False, "error": "remote helper returned an invalid agent id"}
+        return {"ok": True, "agent_id": agent_id}
+    safe_errors = {
+        "invalid agent identity", "relay_url must be a valid ws or wss URL",
+        "desktop-resolved launch data is required", "launch.owner_pubkey is required for intentional stop",
+        "relay-mesh agents cannot be deployed to SSH", "launch environment contains an invalid entry",
+        "presence suppression is forbidden for remote agents", "launch.args must be strings without commas",
+        "invalid respond_to mode", "respond_to_allowlist must contain public keys",
+        "remote project directory must exist and belong to the SSH user",
+        "managed directory is not owned by the SSH user", "managed directory must have mode 0700",
+        "managed directory cannot be a symlink", "managed subdirectory is unsafe",
+        "existing managed state is not private", "existing managed state is unreadable",
+        "existing managed state has a different owner", "managed path is a symlink",
+        "managed lock is a symlink", "launchd GUI domain is unavailable",
+        "agent is already running with different configuration; stop it before redeploy",
+        "could not unload stopped managed job", "launchd could not bootstrap the managed job",
+        "launchd did not retain the managed job", "runtime_command is unavailable on the remote PATH",
+        "runtime_command is unavailable on the remote host",
+        "launch.command is unavailable on the remote PATH",
+        "launch.command must be a command name on the remote PATH",
+        "runtime_command must be a command name on the remote PATH"
+    }
+    error = response.get("error")
+    return {"ok": False, "error": error if error in safe_errors else "remote deployment refused"}
+
+def main():
+    try:
+        request = json.load(sys.stdin)
+        result = respond(request)
+    except (ValueError, UnicodeDecodeError):
+        result = {"ok": False, "error": "invalid JSON request"}
+    print(json.dumps(result, separators=(",", ":")))
+
+if __name__ == "__main__":
+    main()
