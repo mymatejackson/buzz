@@ -157,7 +157,12 @@ fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
     // and never clobbers a value the dev nest already set explicitly.
     // The composed helper keeps gate + migration on the tested code path.
     if let (Some(home), Some(dev_nest)) = (dirs::home_dir(), crate::managed_agents::nest_dir()) {
-        maybe_migrate_dev_repos_dir(import_existing_user_state, reset_completed, &home, &dev_nest);
+        maybe_migrate_dev_repos_dir(
+            import_existing_user_state,
+            reset_completed,
+            &home,
+            &dev_nest,
+        );
     }
 
     if !crate::build_identity::is_demo_build() {
