@@ -21,7 +21,8 @@ Buzz desktop or relay.
 - One label is derived from relay URL and the key public identity. A
   per-label file lock serializes concurrent deploys. Identical running
   deployments return the same label; changed running configuration is refused
-  until the agent stops. A bootstrap failure restores prior managed files.
+  until the agent stops. A launchd label without a matching owned record is
+  refused. A bootstrap failure restores prior managed files.
 - The launchd plist contains only the helper path and nonsecret ID. It has
   RunAtLoad=true and KeepAlive=false. A harness exit, including an
   owner-authorized shutdown, stays stopped. Pressing Start again bootstraps

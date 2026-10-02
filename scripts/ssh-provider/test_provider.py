@@ -192,6 +192,19 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "symlink"):
             self.remote.deploy(self.request)
         self.assertEqual(list(elsewhere.iterdir()), [])
+    def test_unowned_stopped_label_is_never_unloaded(self):
+        self.fake.loaded = True
+        self.fake.running = False
+        with self.assertRaisesRegex(ValueError, "not owned"):
+            self.remote.deploy(self.request)
+        self.assertFalse(any(call[0] == "bootout" for call in self.fake.calls))
+        self.assertEqual(list((self.root / "state").iterdir()), [])
+    def test_failed_new_bootstrap_does_not_unload_another_job(self):
+        self.fake.fail_bootstrap = True
+        with self.assertRaisesRegex(ValueError, "bootstrap"):
+            self.remote.deploy(self.request)
+        self.assertFalse(any(call[0] == "bootout" for call in self.fake.calls))
+        self.assertEqual(list((self.root / "state").iterdir()), [])
     def test_private_log_is_required_before_runtime_exec(self):
         label = self.remote.deploy(self.request)
         digest = label.split(".")[-1]

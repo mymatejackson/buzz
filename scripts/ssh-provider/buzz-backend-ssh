@@ -259,6 +259,8 @@ def deploy(req):
                 fail("existing managed state has a different owner")
         status = launchctl("print", domain + "/" + label)
         loaded = status.returncode == 0
+        if loaded and (old is None or old_plist is None):
+            fail("existing launchd label is not owned by this provider")
         running = loaded and "state = running" in status.stdout
         if running:
             if old and hashlib.sha256(old).hexdigest() == fingerprint:
@@ -275,14 +277,17 @@ def deploy(req):
                  "run", str(root), digest], "WorkingDirectory": str(work_dir),
                  "RunAtLoad": True, "KeepAlive": False, "ProcessType": "Background"}
         atomic(plist_path, plistlib.dumps(plist), 0o600)
+        bootstrapped = False
         try:
             if launchctl("bootstrap", domain, str(plist_path)).returncode:
                 fail("launchd could not bootstrap the managed job")
+            bootstrapped = True
             verified = launchctl("print", domain + "/" + label)
             if verified.returncode:
                 fail("launchd did not retain the managed job")
         except Exception:
-            launchctl("bootout", domain + "/" + label)
+            if bootstrapped:
+                launchctl("bootout", domain + "/" + label)
             if old is None:
                 state_path.unlink(missing_ok=True)
             else:
@@ -401,6 +406,7 @@ def respond(request):
         "managed directory cannot be a symlink", "managed subdirectory is unsafe",
         "existing managed state is not private", "existing managed state is unreadable",
         "existing managed state has a different owner", "managed path is a symlink",
+        "existing launchd label is not owned by this provider",
         "managed lock is a symlink", "launchd GUI domain is unavailable",
         "agent is already running with different configuration; stop it before redeploy",
         "could not unload stopped managed job", "launchd could not bootstrap the managed job",
