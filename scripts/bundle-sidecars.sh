@@ -51,4 +51,16 @@ for bin in "${SIDECARS[@]}"; do
         chmod 755 "$destination"
     fi
 done
+
+if [[ "$TARGET" != *windows* ]]; then
+    ssh_provider_source="scripts/ssh-provider/buzz-backend-ssh"
+    ssh_provider_destination="$BINARIES_DIR/buzz-backend-ssh-$TARGET"
+    [[ -f "$ssh_provider_source" ]] || {
+        echo "Error: missing SSH provider source: $ssh_provider_source" >&2
+        exit 1
+    }
+    cp "$ssh_provider_source" "$ssh_provider_destination"
+    chmod 755 "$ssh_provider_destination"
+fi
+
 echo "Sidecars bundled for $TARGET"

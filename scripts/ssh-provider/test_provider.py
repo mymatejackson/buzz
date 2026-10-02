@@ -198,6 +198,66 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(self.remote.deploy(self.request), label)
         self.assertEqual(sum(call[0] == "bootstrap" for call in self.fake.calls), 2)
 
+    def test_initial_label_probe_error_preserves_stopped_job_and_files(self):
+        label = self.remote.deploy(self.request)
+        self.fake.running = False
+        digest = label.split(".")[-1]
+        state_path = self.root / "state" / (digest + ".json")
+        plist_path = self.root / "jobs" / (label + ".plist")
+        before_state = state_path.read_bytes()
+        before_plist = plist_path.read_bytes()
+        changed = json.loads(json.dumps(self.request))
+        changed["agent"]["launch"]["env"]["MODEL"] = "changed"
+        first_label_probe = True
+
+        def launchctl(*args):
+            nonlocal first_label_probe
+            if args[0] == "print" and args[1].endswith(label) and first_label_probe:
+                first_label_probe = False
+                return subprocess.CompletedProcess(args, 1, "", "")
+            return self.fake(*args)
+
+        marker = len(self.fake.calls)
+        self.remote.launchctl = launchctl
+        with self.assertRaisesRegex(self.remote.RecoveryRequired, "preserved"):
+            self.remote.deploy(changed)
+        self.assertEqual(state_path.read_bytes(), before_state)
+        self.assertEqual(plist_path.read_bytes(), before_plist)
+        self.assertTrue(self.fake.loaded)
+        self.assertFalse(self.fake.running)
+        self.assertFalse(
+            any(call[0] == "bootout" for call in self.fake.calls[marker:])
+        )
+
+    def test_post_bootstrap_ownership_mismatch_is_preserved(self):
+        bootstrapped = False
+
+        def launchctl(*args):
+            nonlocal bootstrapped
+            result = self.fake(*args)
+            if args[0] == "bootstrap":
+                bootstrapped = True
+            elif args[0] == "print" and len(args) == 2 and bootstrapped:
+                result = subprocess.CompletedProcess(
+                    args,
+                    result.returncode,
+                    result.stdout.replace(
+                        "path = " + str(self.fake.plist_path),
+                        "path = /tmp/other-root/job.plist",
+                    ),
+                    result.stderr,
+                )
+            return result
+
+        self.remote.launchctl = launchctl
+        with self.assertRaisesRegex(self.remote.RecoveryRequired, "preserved"):
+            self.remote.deploy(self.request)
+        self.assertTrue(self.fake.loaded)
+        self.assertTrue(list((self.root / "state").iterdir()))
+        self.assertTrue(list((self.root / "jobs").iterdir()))
+        self.assertTrue(list((self.root / "helpers").iterdir()))
+        self.assertFalse(any(call[0] == "bootout" for call in self.fake.calls))
+
     def test_stage_failure_before_bootout_leaves_old_job_and_files(self):
         label = self.remote.deploy(self.request)
         self.fake.running = False
@@ -356,6 +416,75 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(list((self.root / "jobs").iterdir()), [])
         self.assertEqual(list((self.root / "helpers").iterdir()), [])
 
+    def test_cleanup_bootout_timeout_preserves_replacement_for_recovery(self):
+        label = self.remote.deploy(self.request)
+        self.fake.running = False
+        changed = json.loads(json.dumps(self.request))
+        changed["agent"]["launch"]["env"]["MODEL"] = "changed"
+        self.fake.exit_next_bootstrap = True
+        bootouts = 0
+
+        def launchctl(*args):
+            nonlocal bootouts
+            if args[0] == "bootout":
+                bootouts += 1
+                if bootouts == 2:
+                    raise subprocess.TimeoutExpired(args, 15)
+            return self.fake(*args)
+
+        self.remote.launchctl = launchctl
+        with self.assertRaisesRegex(self.remote.RecoveryRequired, "preserved"):
+            self.remote.deploy(changed)
+        digest = label.split(".")[-1]
+        state = json.loads(
+            (self.root / "state" / (digest + ".json")).read_text()
+        )
+        self.assertEqual(state["env"]["MODEL"], "changed")
+        self.assertTrue(self.fake.loaded)
+        self.assertEqual(bootouts, 2)
+
+    def test_cleanup_bootout_nonzero_preserves_replacement_for_recovery(self):
+        label = self.remote.deploy(self.request)
+        self.fake.running = False
+        changed = json.loads(json.dumps(self.request))
+        changed["agent"]["launch"]["env"]["MODEL"] = "changed"
+        self.fake.exit_next_bootstrap = True
+        bootouts = 0
+
+        def launchctl(*args):
+            nonlocal bootouts
+            if args[0] == "bootout":
+                bootouts += 1
+                if bootouts == 2:
+                    return subprocess.CompletedProcess(args, 1, "", "")
+            return self.fake(*args)
+
+        self.remote.launchctl = launchctl
+        with self.assertRaisesRegex(self.remote.RecoveryRequired, "preserved"):
+            self.remote.deploy(changed)
+        digest = label.split(".")[-1]
+        state = json.loads(
+            (self.root / "state" / (digest + ".json")).read_text()
+        )
+        self.assertEqual(state["env"]["MODEL"], "changed")
+        self.assertTrue(self.fake.loaded)
+        self.assertEqual(bootouts, 2)
+
+    def test_bootstrap_accepted_then_timeout_is_reconciled(self):
+        real_launchctl = self.fake
+
+        def launchctl(*args):
+            result = real_launchctl(*args)
+            if args[0] == "bootstrap":
+                raise subprocess.TimeoutExpired(args, 15)
+            return result
+
+        self.remote.launchctl = launchctl
+        label = self.remote.deploy(self.request)
+        self.assertTrue(self.fake.loaded)
+        self.assertTrue(self.fake.running)
+        self.assertEqual(label, "local.buzz.ssh." + label.split(".")[-1])
+
     def test_remote_command_cannot_be_client_path(self):
         req = json.loads(json.dumps(self.request))
         req["agent"]["launch"]["command"] = (
@@ -454,6 +583,18 @@ class ProviderTests(unittest.TestCase):
             result = provider.respond(self.request)
         self.assertEqual(
             result, {"ok": False, "error": "remote deployment refused"}
+        )
+
+    def test_recovery_required_error_is_safe_for_the_gui(self):
+        self.assertEqual(self.remote.RECOVERY_ERROR, provider.RECOVERY_ERROR)
+        response = json.dumps(
+            {"ok": False, "error": self.remote.RECOVERY_ERROR}
+        ).encode()
+        with mock.patch.object(provider.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, response, b"")
+            result = provider.respond(self.request)
+        self.assertEqual(
+            result, {"ok": False, "error": provider.RECOVERY_ERROR}
         )
 
     def test_missing_remote_runtime_refuses_before_writes(self):

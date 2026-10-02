@@ -44,6 +44,11 @@ START_STABILITY_SECONDS = 0.25
 ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 HEX64 = re.compile(r"[0-9a-fA-F]{64}\Z")
 LABEL = re.compile(r"local\.buzz\.ssh\.[0-9a-f]{20}\Z")
+RECOVERY_ERROR = "launchd recovery is uncertain; managed files were preserved"
+
+class RecoveryRequired(ValueError):
+    pass
+
 
 def fail(message):
     raise ValueError(message)
@@ -303,7 +308,57 @@ def loaded_job_owned(status, plist_path, args):
             return False
     return True
 
-def confirm_running(domain, label):
+def inspect_job(domain, label, plist_path, args):
+    try:
+        status = launchctl("print", domain + "/" + label)
+    except (subprocess.SubprocessError, OSError):
+        return "unknown"
+    if status.returncode == 113:
+        return "absent"
+    if status.returncode:
+        return "unknown"
+    return "owned" if loaded_job_owned(status, plist_path, args) else "mismatch"
+
+def unload_stopped_job(domain, label, plist_path, args):
+    try:
+        result = launchctl("bootout", domain + "/" + label)
+    except (subprocess.SubprocessError, OSError):
+        result = None
+    outcome = inspect_job(domain, label, plist_path, args)
+    if outcome == "absent":
+        return
+    if outcome == "owned":
+        fail("could not unload stopped managed job")
+    raise RecoveryRequired(RECOVERY_ERROR)
+
+def bootstrap_owned_job(domain, label, plist_path, args):
+    try:
+        result = launchctl("bootstrap", domain, str(plist_path))
+    except (subprocess.SubprocessError, OSError):
+        result = None
+    if result is not None and result.returncode == 0:
+        return
+    outcome = inspect_job(domain, label, plist_path, args)
+    if outcome == "owned":
+        return
+    if outcome == "absent":
+        fail("launchd could not bootstrap the managed job")
+    raise RecoveryRequired(RECOVERY_ERROR)
+
+def require_replacement_absent(domain, label, plist_path, args):
+    outcome = inspect_job(domain, label, plist_path, args)
+    if outcome == "absent":
+        return
+    if outcome != "owned":
+        raise RecoveryRequired(RECOVERY_ERROR)
+    try:
+        launchctl("bootout", domain + "/" + label)
+    except (subprocess.SubprocessError, OSError):
+        pass
+    if inspect_job(domain, label, plist_path, args) != "absent":
+        raise RecoveryRequired(RECOVERY_ERROR)
+
+def confirm_running(domain, label, plist_path, args):
     deadline = time.monotonic() + START_TIMEOUT_SECONDS
     stable_since = None
     stable_pid = None
@@ -311,6 +366,8 @@ def confirm_running(domain, label):
         status = launchctl("print", domain + "/" + label)
         if status.returncode:
             fail("launchd did not retain the managed job")
+        if not loaded_job_owned(status, plist_path, args):
+            raise RecoveryRequired(RECOVERY_ERROR)
         state = re.search(r"(?m)^\s*state = (\S+)\s*$", status.stdout)
         pid = re.search(r"(?m)^\s*pid = ([0-9]+)\s*$", status.stdout)
         if state and state.group(1) == "running" and pid and int(pid.group(1)) > 0:
@@ -330,14 +387,23 @@ def confirm_running(domain, label):
 
 def restore_stopped_job(domain, plist_path, old_plist):
     value = plistlib.loads(old_plist)
+    label = value["Label"]
+    args = value["ProgramArguments"]
     value["RunAtLoad"] = False
     atomic(plist_path, plistlib.dumps(value), 0o600)
     try:
-        result = launchctl("bootstrap", domain, str(plist_path))
+        try:
+            launchctl("bootstrap", domain, str(plist_path))
+        except (subprocess.SubprocessError, OSError):
+            pass
     finally:
         atomic(plist_path, old_plist, 0o600)
-    if result.returncode:
+    outcome = inspect_job(domain, label, plist_path, args)
+    if outcome == "owned":
+        return
+    if outcome == "absent":
         fail("prior managed job could not be restored")
+    raise RecoveryRequired(RECOVERY_ERROR)
 
 def deploy(req):
     cfg = req.get("provider_config")
@@ -425,8 +491,16 @@ def deploy(req):
                 fail("existing managed state has a different owner")
             old_args = owned_plist(old_plist, label, root, digest)
 
-        status = launchctl("print", domain + "/" + label)
-        loaded = status.returncode == 0
+        try:
+            status = launchctl("print", domain + "/" + label)
+        except (subprocess.SubprocessError, OSError):
+            raise RecoveryRequired(RECOVERY_ERROR)
+        if status.returncode == 113:
+            loaded = False
+        elif status.returncode == 0:
+            loaded = True
+        else:
+            raise RecoveryRequired(RECOVERY_ERROR)
         if loaded and (old_args is None or not loaded_job_owned(status, plist_path, old_args)):
             fail("existing launchd label is not owned by this provider")
         running = loaded and re.search(r"(?m)^\s*state = running\s*$", status.stdout)
@@ -461,26 +535,27 @@ def deploy(req):
             raise
 
         old_unloaded = False
-        bootstrapped = False
+        writes_started = False
         helper_created = False
+        new_args = plist["ProgramArguments"]
         try:
             if loaded:
-                if launchctl("bootout", domain + "/" + label).returncode:
-                    fail("could not unload stopped managed job")
+                unload_stopped_job(domain, label, plist_path, old_args)
                 old_unloaded = True
+            writes_started = True
             if helper_stage is not None:
                 install_staged(helper_stage, helper_path)
                 helper_created = True
             install_staged(state_stage, state_path)
             install_staged(plist_stage, plist_path)
-            if launchctl("bootstrap", domain, str(plist_path)).returncode:
-                fail("launchd could not bootstrap the managed job")
-            bootstrapped = True
-            confirm_running(domain, label)
+            bootstrap_owned_job(domain, label, plist_path, new_args)
+            confirm_running(domain, label, plist_path, new_args)
+        except RecoveryRequired:
+            raise
         except Exception:
-            rollback_failed = False
-            if bootstrapped and launchctl("bootout", domain + "/" + label).returncode:
-                rollback_failed = True
+            if not writes_started:
+                raise
+            require_replacement_absent(domain, label, plist_path, new_args)
             try:
                 if old is None:
                     state_path.unlink(missing_ok=True)
@@ -492,9 +567,9 @@ def deploy(req):
                     helper_path.unlink(missing_ok=True)
                 if old_unloaded:
                     restore_stopped_job(domain, plist_path, old_plist)
+            except RecoveryRequired:
+                raise
             except Exception:
-                rollback_failed = True
-            if rollback_failed:
                 fail("deployment failed and prior managed job could not be restored")
             raise
         finally:
@@ -576,6 +651,8 @@ if __name__ == "__main__":
         print(json.dumps({"ok": False, "error": str(exc) if isinstance(exc, ValueError) else "remote deployment failed"}))
 '''
 
+RECOVERY_ERROR = "launchd recovery is uncertain; managed files were preserved"
+
 SCHEMA = {
     "type": "object",
     "properties": {
@@ -650,6 +727,7 @@ def respond(request):
         "launchd did not retain the managed job", "managed runtime exited during startup",
         "managed runtime did not become stably running",
         "deployment failed and prior managed job could not be restored",
+        RECOVERY_ERROR,
         "remote PATH is unsafe", "runtime_command is unavailable on the remote PATH",
         "runtime_command is unavailable on the remote host",
         "runtime_command has an invalid interpreter",
