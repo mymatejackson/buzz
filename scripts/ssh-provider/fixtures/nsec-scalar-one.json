@@ -1,0 +1,6 @@
+{
+  "source": "nostr::SecretKey::from_hex(0000000000000000000000000000000000000000000000000000000000000001).to_bech32()",
+  "scalar_hex": "0000000000000000000000000000000000000000000000000000000000000001",
+  "nsec": "nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsmhltgl",
+  "pubkey_hex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+}

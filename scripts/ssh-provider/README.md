@@ -19,19 +19,32 @@ Buzz desktop or relay.
   The JSON state contains the deployed identity and is mode 0600; it must
   never be committed, copied into a public report, or treated as a backup.
 - One label is derived from relay URL and the key public identity. A
-  per-label file lock serializes concurrent deploys. Identical running
-  deployments return the same label; changed running configuration is refused
-  until the agent stops. A launchd label without a matching owned record is
-  refused. A bootstrap failure restores prior managed files.
+  per-label file lock serializes concurrent deploys. Ownership requires the
+  canonical managed root, plist path, helper path, and launchd arguments to
+  match the loaded job. A copied record from another root cannot authorize
+  idempotency or unload that job.
+- Helper files are content addressed, immutable, and scoped per agent
+  identity. State, plist, and helper replacements are staged and validated
+  before a stopped job is unloaded.
+  Commit or startup failure restores prior files and reloads a previously
+  stopped job without running it. A new failed deployment removes the
+  ownership files it created.
 - The launchd plist contains only the helper path and nonsecret ID. It has
   RunAtLoad=true and KeepAlive=false. A harness exit, including an
   owner-authorized shutdown, stays stopped. Pressing Start again bootstraps
-  the stopped job. This prototype does not claim crash restart or reboot
+  the stopped job. Startup requires a stable running state and PID for a
+  bounded interval. This proves process liveness only; relay presence is a
+  separate live check. This prototype does not claim crash restart or reboot
   persistence.
 - No live identity, SSH connection, or launchd service is used by the tests.
-  The runtime and ACP command are resolved on the remote host. The runtime
-  can be a remote absolute executable path; the desktop-resolved ACP
-  launch.command must be a portable command name.
+  The runtime and ACP command are resolved on the remote host. Their shebang
+  interpreters are checked against the exact PATH saved for launchd.
+- Every managed process receives a private project-local HOME, XDG config,
+  cache and data roots, temporary directory, BUZZ_AGENT_CONFIG_DIR,
+  CODEX_HOME, and CLAUDE_CONFIG_DIR. The provider does not inherit the SSH
+  session environment at exec time and does not read or copy existing user
+  credentials. A later live trial therefore needs an explicitly reviewed,
+  provider-owned credential provisioning step.
 
 ## Isolated development identity
 
@@ -59,10 +72,11 @@ Run from the repository root:
     printf '{"op":"info"}' | scripts/ssh-provider/buzz-backend-ssh
 
 Tests use temporary directories and a fake launchctl. They cover wire info,
-identity and owner refusal, strict SSH options and argument safety, remote
-bootstrap, one-job duplicate suppression, changed-running refusal, restart
-after stop, rollback, symlink refusal, missing runtime, and remote error
-redaction.
+an independent Rust Nostr scalar-one nsec fixture, strict SSH argument safety,
+canonical loaded-job ownership, cross-root duplicate refusal, concurrent
+per-identity helper rollback, pre-unload staging failure, post-unload
+rollback, isolated runtime profiles, missing shebang dependencies, immediate
+process exit, intentional stop and restart, symlink refusal, missing runtime, and error redaction.
 
 ## Required before a live trial
 
@@ -83,9 +97,22 @@ redaction.
 The current desktop provider protocol has info and deploy, but no undeploy
 operation. Status comes from relay presence. Model discovery and harness
 selection currently probe the local desktop, so this prototype does not yet
-provide host-aware model lists or complete edit/stop/delete parity. Those
-need small capability-gated desktop changes and a defined remote
-configuration/restart path.
+provide host-aware model lists or complete edit/stop/delete parity.
+
+## Minimum desktop follow-up
+
+1. Add optional provider capabilities for remote harness and model discovery;
+   retain the current local hooks for providers that do not expose them.
+2. Extend the managed deployment record with the canonical provider name,
+   provider configuration, backend agent ID, and an ownership version.
+3. Add provider lifecycle operations for status, intentional stop, restart,
+   reconfigure, and remove. Each operation must verify the same canonical
+   ownership tuple before touching launchd.
+4. Present process startup and relay presence separately. A running PID is
+   not proof that the identity is online, and stale relay presence is not
+   proof that this launchd job is healthy.
+5. Gate these fields and controls on provider capabilities so stock social,
+   identity, community, and local Kubernetes behavior remain unchanged.
 
 ## Separate-client test sequence
 

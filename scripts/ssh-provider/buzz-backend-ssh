@@ -19,13 +19,16 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
+import time
 from urllib.parse import urlparse
 
-ALPHABET = "023456789acdefghjklmnpqrstuvwxyz"
+ALPHABET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 FIELD = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
 GX = 55066263022277343669578718895168534326250603453777594175500187360389116729240
 GY = 32670510020758816978083085130507043184471273380659243275938904335757337482424
@@ -33,7 +36,11 @@ RESERVED = {"BUZZ_RELAY_URL", "BUZZ_PRIVATE_KEY", "NOSTR_PRIVATE_KEY",
             "BUZZ_AUTH_TAG", "BUZZ_ACP_AGENT_OWNER", "BUZZ_ACP_AGENT_COMMAND",
             "BUZZ_ACP_AGENT_ARGS", "BUZZ_ACP_RESPOND_TO",
             "BUZZ_ACP_RESPOND_TO_ALLOWLIST", "BUZZ_ACP_MCP_COMMAND",
-            "BUZZ_ACP_EXIT_AFTER_INACTIVITY", "BUZZ_MANAGED_AGENT_START_NONCE"}
+            "BUZZ_ACP_EXIT_AFTER_INACTIVITY", "BUZZ_MANAGED_AGENT_START_NONCE",
+            "HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+            "BUZZ_AGENT_CONFIG_DIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "TMPDIR", "PATH"}
+START_TIMEOUT_SECONDS = 1.0
+START_STABILITY_SECONDS = 0.25
 ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 HEX64 = re.compile(r"[0-9a-fA-F]{64}\Z")
 LABEL = re.compile(r"local\.buzz\.ssh\.[0-9a-f]{20}\Z")
@@ -93,7 +100,7 @@ def pubkey(scalar):
     return f"{result[0]:064x}"
 
 def safe_root(value):
-    if not isinstance(value, str):
+    if not isinstance(value, str) or any(c in value for c in ("\0", "\r", "\n")):
         fail("remote_directory must be an absolute path")
     path = Path(value)
     if not path.is_absolute() or path.name != ".buzz-ssh-provider" or ".." in path.parts:
@@ -101,6 +108,7 @@ def safe_root(value):
     parent = path.parent
     if not parent.is_dir() or parent.is_symlink() or parent.stat().st_uid != os.getuid():
         fail("remote project directory must exist and belong to the SSH user")
+    path = parent.resolve() / path.name
     if path.is_symlink():
         fail("managed directory cannot be a symlink")
     if path.exists():
@@ -110,7 +118,14 @@ def safe_root(value):
             fail("managed directory must have mode 0700")
     return path
 
-def command(value, label, allow_absolute=False):
+def deployment_path():
+    raw = os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+    parts = raw.split(":")
+    if not parts or any(not part or not Path(part).is_absolute() for part in parts):
+        fail("remote PATH is unsafe")
+    return ":".join(dict.fromkeys(parts))
+
+def command(value, label, path_value, allow_absolute=False):
     if allow_absolute and isinstance(value, str) and Path(value).is_absolute():
         path = Path(value)
         if not path.is_file() or not os.access(path, os.X_OK):
@@ -118,12 +133,38 @@ def command(value, label, allow_absolute=False):
         return str(path.resolve())
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.+-]*", value):
         fail(label + " must be a command name on the remote PATH")
-    found = shutil.which(value)
+    found = shutil.which(value, path=path_value)
     if not found:
         fail(label + " is unavailable on the remote PATH")
     return str(Path(found).resolve())
 
-def env_for(agent, runtime):
+def preflight_executable(value, env, label):
+    path = Path(value)
+    if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
+        fail(label + " is unavailable on the remote host")
+    try:
+        with path.open("rb") as source:
+            header = source.read(256)
+    except OSError:
+        fail(label + " is unavailable on the remote host")
+    if not header.startswith(b"#!"):
+        return
+    try:
+        words = shlex.split(header.splitlines()[0][2:].decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        fail(label + " has an invalid interpreter")
+    if not words:
+        fail(label + " has an invalid interpreter")
+    if words[0] == "/usr/bin/env":
+        if len(words) != 2 or words[1].startswith("-"):
+            fail(label + " has an unsupported env interpreter")
+        interpreter = shutil.which(words[1], path=env["PATH"])
+        if not interpreter or not os.access(interpreter, os.X_OK):
+            fail(label + " interpreter is unavailable on the managed PATH")
+    elif not Path(words[0]).is_absolute() or not Path(words[0]).is_file() or not os.access(words[0], os.X_OK):
+        fail(label + " interpreter is unavailable on the remote host")
+
+def env_for(agent, work_dir, path_value):
     nsec = agent.get("private_key_nsec")
     key = pubkey(decode_nsec(nsec))
     relay = agent.get("relay_url")
@@ -162,13 +203,13 @@ def env_for(agent, runtime):
         merged["BUZZ_AUTH_TAG"] = tag.strip()
     agent_cmd = launch.get("command")
     if agent_cmd:
-        merged["BUZZ_ACP_AGENT_COMMAND"] = command(agent_cmd, "launch.command")
+        merged["BUZZ_ACP_AGENT_COMMAND"] = command(agent_cmd, "launch.command", path_value)
     args = launch.get("args", [])
     if not isinstance(args, list) or any(not isinstance(a, str) or "," in a for a in args):
         fail("launch.args must be strings without commas")
     if args:
         merged["BUZZ_ACP_AGENT_ARGS"] = ",".join(args)
-    mcp = shutil.which("buzz-dev-mcp")
+    mcp = shutil.which("buzz-dev-mcp", path=path_value)
     if mcp:
         merged["BUZZ_ACP_MCP_COMMAND"] = str(Path(mcp).resolve())
     respond = agent.get("respond_to")
@@ -181,28 +222,122 @@ def env_for(agent, runtime):
             if not isinstance(allow, list) or not allow or any(not isinstance(x, str) or not HEX64.fullmatch(x) for x in allow):
                 fail("respond_to_allowlist must contain public keys")
             merged["BUZZ_ACP_RESPOND_TO_ALLOWLIST"] = ",".join(allow)
+    profiles = {
+        "HOME": work_dir / "home",
+        "XDG_CONFIG_HOME": work_dir / "config",
+        "XDG_CACHE_HOME": work_dir / "cache",
+        "XDG_DATA_HOME": work_dir / "data",
+        "BUZZ_AGENT_CONFIG_DIR": work_dir / "config" / "buzz-agent",
+        "CODEX_HOME": work_dir / "config" / "codex",
+        "CLAUDE_CONFIG_DIR": work_dir / "config" / "claude",
+        "TMPDIR": work_dir / "tmp",
+    }
+    for name, directory in profiles.items():
+        merged[name] = str(directory)
+    merged["PATH"] = path_value
     merged["BUZZ_ACP_EXIT_AFTER_INACTIVITY"] = "7200"
     return key, merged
 
-def atomic(path, data, mode):
+def stage_file(path, data, mode):
     if path.is_symlink():
         fail("managed path is a symlink")
-    temp = path.with_name(path.name + ".tmp." + str(os.getpid()))
-    fd = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+    fd, name = tempfile.mkstemp(prefix=path.name + ".stage.", dir=str(path.parent))
+    staged = Path(name)
     try:
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "wb") as out:
             out.write(data)
             out.flush()
             os.fsync(out.fileno())
-        os.replace(temp, path)
-    finally:
+        return staged
+    except Exception:
         try:
-            temp.unlink()
-        except FileNotFoundError:
+            os.close(fd)
+        except OSError:
             pass
+        staged.unlink(missing_ok=True)
+        raise
+
+def install_staged(staged, path):
+    if path.is_symlink():
+        fail("managed path is a symlink")
+    os.replace(staged, path)
+
+def atomic(path, data, mode):
+    staged = stage_file(path, data, mode)
+    try:
+        install_staged(staged, path)
+    finally:
+        staged.unlink(missing_ok=True)
 
 def launchctl(*args):
     return subprocess.run(["/bin/launchctl", *args], capture_output=True, text=True, timeout=15)
+
+def owned_plist(data, label, root, digest):
+    try:
+        value = plistlib.loads(data)
+    except Exception:
+        fail("existing managed plist is unreadable")
+    args = value.get("ProgramArguments")
+    if value.get("Label") != label or not isinstance(args, list) or len(args) != 5:
+        fail("existing managed plist has a different owner")
+    if args[2:] != ["run", str(root), digest]:
+        fail("existing managed plist has a different owner")
+    python_path = Path(args[0])
+    helper_path = Path(args[1])
+    historical = helper_path == root / "helper.py"
+    immutable = (helper_path.parent == root / "helpers"
+                 and re.fullmatch(r"helper-[0-9a-f]{20}-[0-9a-f]{16}\.py", helper_path.name))
+    if not python_path.is_absolute() or not helper_path.is_absolute() or not (historical or immutable):
+        fail("existing managed plist has a different owner")
+    return args
+
+def loaded_job_owned(status, plist_path, args):
+    if status.returncode:
+        return False
+    path_match = re.search(r"(?m)^\s*path = (.+?)\s*$", status.stdout)
+    if not path_match or path_match.group(1) != str(plist_path):
+        return False
+    for argument in args:
+        if not re.search(r"(?m)^\s*" + re.escape(argument) + r"\s*$", status.stdout):
+            return False
+    return True
+
+def confirm_running(domain, label):
+    deadline = time.monotonic() + START_TIMEOUT_SECONDS
+    stable_since = None
+    stable_pid = None
+    while time.monotonic() < deadline:
+        status = launchctl("print", domain + "/" + label)
+        if status.returncode:
+            fail("launchd did not retain the managed job")
+        state = re.search(r"(?m)^\s*state = (\S+)\s*$", status.stdout)
+        pid = re.search(r"(?m)^\s*pid = ([0-9]+)\s*$", status.stdout)
+        if state and state.group(1) == "running" and pid and int(pid.group(1)) > 0:
+            current_pid = pid.group(1)
+            if stable_pid != current_pid:
+                stable_pid = current_pid
+                stable_since = time.monotonic()
+            if time.monotonic() - stable_since >= START_STABILITY_SECONDS:
+                return
+        elif state and state.group(1) in ("exited", "stopped"):
+            fail("managed runtime exited during startup")
+        else:
+            stable_since = None
+            stable_pid = None
+        time.sleep(0.02)
+    fail("managed runtime did not become stably running")
+
+def restore_stopped_job(domain, plist_path, old_plist):
+    value = plistlib.loads(old_plist)
+    value["RunAtLoad"] = False
+    atomic(plist_path, plistlib.dumps(value), 0o600)
+    try:
+        result = launchctl("bootstrap", domain, str(plist_path))
+    finally:
+        atomic(plist_path, old_plist, 0o600)
+    if result.returncode:
+        fail("prior managed job could not be restored")
 
 def deploy(req):
     cfg = req.get("provider_config")
@@ -212,24 +347,44 @@ def deploy(req):
     if set(cfg) - {"host", "remote_directory", "runtime_command"}:
         fail("unsupported provider configuration field")
     root = safe_root(cfg.get("remote_directory"))
-    runtime = command(cfg.get("runtime_command", "buzz-acp"), "runtime_command", allow_absolute=True)
-    identity, env = env_for(agent, runtime)
-    relay = agent["relay_url"]
+    path_value = deployment_path()
+    runtime = command(cfg.get("runtime_command", "buzz-acp"), "runtime_command",
+                      path_value, allow_absolute=True)
+    identity = pubkey(decode_nsec(agent.get("private_key_nsec")))
+    relay = agent.get("relay_url")
+    parsed = urlparse(relay if isinstance(relay, str) else "")
+    if parsed.scheme not in ("ws", "wss") or not parsed.netloc or parsed.username or parsed.password:
+        fail("relay_url must be a valid ws or wss URL")
     digest = hashlib.sha256((relay + "\0" + identity).encode()).hexdigest()[:20]
     label = "local.buzz.ssh." + digest
     domain = "gui/" + str(os.getuid())
-    domain_check = launchctl("print", domain)
-    if domain_check.returncode:
+    work_dir = root / "work" / digest
+    checked_identity, env = env_for(agent, work_dir, path_value)
+    if checked_identity != identity:
+        fail("invalid agent identity")
+    preflight_executable(runtime, env, "runtime_command")
+    if "BUZZ_ACP_AGENT_COMMAND" in env:
+        preflight_executable(env["BUZZ_ACP_AGENT_COMMAND"], env, "launch.command")
+    if "BUZZ_ACP_MCP_COMMAND" in env:
+        preflight_executable(env["BUZZ_ACP_MCP_COMMAND"], env, "buzz-dev-mcp")
+    if launchctl("print", domain).returncode:
         fail("launchd GUI domain is unavailable")
+
     root.mkdir(mode=0o700, exist_ok=True)
     state_dir = root / "state"
     job_dir = root / "jobs"
     log_dir = root / "logs"
-    work_dir = root / "work" / digest
-    for path in (state_dir, job_dir, log_dir, root / "work", work_dir):
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if path.is_symlink() or path.stat().st_uid != os.getuid() or stat.S_IMODE(path.stat().st_mode) & 0o077:
+    helper_dir = root / "helpers"
+    directories = [state_dir, job_dir, log_dir, helper_dir, root / "work", work_dir]
+    directories.extend(Path(env[name]) for name in
+                       ("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+                        "BUZZ_AGENT_CONFIG_DIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "TMPDIR"))
+    for directory in directories:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if (directory.is_symlink() or directory.stat().st_uid != os.getuid()
+                or stat.S_IMODE(directory.stat().st_mode) & 0o077):
             fail("managed subdirectory is unsafe")
+
     lock = root / ("lock-" + digest)
     if lock.is_symlink():
         fail("managed lock is a symlink")
@@ -238,89 +393,169 @@ def deploy(req):
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         state_path = state_dir / (digest + ".json")
         plist_path = job_dir / (label + ".plist")
-        helper_path = root / "helper.py"
-        for path in (state_path, plist_path, helper_path):
-            if path.is_symlink():
+        source = globals().get("_SOURCE")
+        if not isinstance(source, bytes):
+            fail("remote helper source missing")
+        source_hash = hashlib.sha256(source).hexdigest()
+        helper_path = helper_dir / ("helper-" + digest + "-" + source_hash[:16] + ".py")
+        for managed in (state_path, plist_path, helper_path):
+            if managed.is_symlink():
                 fail("managed path is a symlink")
+
         record = {"owner": "buzz-backend-ssh-v1", "label": label, "relay": relay,
-                  "pubkey": identity, "runtime": runtime, "env": env}
+                  "pubkey": identity, "runtime": runtime, "env": env,
+                  "root": str(root), "helper": str(helper_path)}
         encoded = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
         fingerprint = hashlib.sha256(encoded).hexdigest()
-        if state_path.exists() and stat.S_IMODE(state_path.stat().st_mode) & 0o077:
-            fail("existing managed state is not private")
+        for existing in (state_path, plist_path):
+            if existing.exists() and (existing.stat().st_uid != os.getuid()
+                                      or stat.S_IMODE(existing.stat().st_mode) & 0o077):
+                fail("existing managed files are not private")
         old = state_path.read_bytes() if state_path.exists() else None
         old_plist = plist_path.read_bytes() if plist_path.exists() else None
-        if old:
+        if (old is None) != (old_plist is None):
+            fail("existing managed files are incomplete")
+        old_args = None
+        if old is not None:
             try:
                 previous = json.loads(old)
             except (ValueError, UnicodeDecodeError):
                 fail("existing managed state is unreadable")
             if previous.get("owner") != "buzz-backend-ssh-v1" or previous.get("label") != label:
                 fail("existing managed state has a different owner")
+            old_args = owned_plist(old_plist, label, root, digest)
+
         status = launchctl("print", domain + "/" + label)
         loaded = status.returncode == 0
-        if loaded and (old is None or old_plist is None):
+        if loaded and (old_args is None or not loaded_job_owned(status, plist_path, old_args)):
             fail("existing launchd label is not owned by this provider")
-        running = loaded and "state = running" in status.stdout
+        running = loaded and re.search(r"(?m)^\s*state = running\s*$", status.stdout)
         if running:
-            if old and hashlib.sha256(old).hexdigest() == fingerprint:
+            if hashlib.sha256(old).hexdigest() == fingerprint:
                 return label
             fail("agent is already running with different configuration; stop it before redeploy")
-        if loaded and launchctl("bootout", domain + "/" + label).returncode:
-            fail("could not unload stopped managed job")
-        source = globals().get("_SOURCE")
-        if not isinstance(source, bytes):
-            fail("remote helper source missing")
-        atomic(helper_path, source, 0o600)
-        atomic(state_path, encoded, 0o600)
-        plist = {"Label": label, "ProgramArguments": [sys.executable, str(helper_path),
-                 "run", str(root), digest], "WorkingDirectory": str(work_dir),
-                 "RunAtLoad": True, "KeepAlive": False, "ProcessType": "Background"}
-        atomic(plist_path, plistlib.dumps(plist), 0o600)
-        bootstrapped = False
+
+        if helper_path.exists():
+            if (not helper_path.is_file() or helper_path.stat().st_uid != os.getuid()
+                    or stat.S_IMODE(helper_path.stat().st_mode) & 0o077
+                    or helper_path.read_bytes() != source):
+                fail("existing immutable helper is unsafe")
+            helper_stage = None
+        else:
+            helper_stage = stage_file(helper_path, source, 0o600)
+        plist = {"Label": label,
+                 "ProgramArguments": [sys.executable, str(helper_path), "run", str(root), digest],
+                 "WorkingDirectory": str(work_dir), "RunAtLoad": True, "KeepAlive": False,
+                 "ProcessType": "Background"}
+        state_stage = plist_stage = None
         try:
+            state_stage = stage_file(state_path, encoded, 0o600)
+            plist_stage = stage_file(plist_path, plistlib.dumps(plist), 0o600)
+        except Exception:
+            if helper_stage is not None:
+                helper_stage.unlink(missing_ok=True)
+            if state_stage is not None:
+                state_stage.unlink(missing_ok=True)
+            if plist_stage is not None:
+                plist_stage.unlink(missing_ok=True)
+            raise
+
+        old_unloaded = False
+        bootstrapped = False
+        helper_created = False
+        try:
+            if loaded:
+                if launchctl("bootout", domain + "/" + label).returncode:
+                    fail("could not unload stopped managed job")
+                old_unloaded = True
+            if helper_stage is not None:
+                install_staged(helper_stage, helper_path)
+                helper_created = True
+            install_staged(state_stage, state_path)
+            install_staged(plist_stage, plist_path)
             if launchctl("bootstrap", domain, str(plist_path)).returncode:
                 fail("launchd could not bootstrap the managed job")
             bootstrapped = True
-            verified = launchctl("print", domain + "/" + label)
-            if verified.returncode:
-                fail("launchd did not retain the managed job")
+            confirm_running(domain, label)
         except Exception:
-            if bootstrapped:
-                launchctl("bootout", domain + "/" + label)
-            if old is None:
-                state_path.unlink(missing_ok=True)
-            else:
-                atomic(state_path, old, 0o600)
-            if old_plist is None:
-                plist_path.unlink(missing_ok=True)
-            else:
-                atomic(plist_path, old_plist, 0o600)
+            rollback_failed = False
+            if bootstrapped and launchctl("bootout", domain + "/" + label).returncode:
+                rollback_failed = True
+            try:
+                if old is None:
+                    state_path.unlink(missing_ok=True)
+                    plist_path.unlink(missing_ok=True)
+                else:
+                    atomic(state_path, old, 0o600)
+                    atomic(plist_path, old_plist, 0o600)
+                if helper_created:
+                    helper_path.unlink(missing_ok=True)
+                if old_unloaded:
+                    restore_stopped_job(domain, plist_path, old_plist)
+            except Exception:
+                rollback_failed = True
+            if rollback_failed:
+                fail("deployment failed and prior managed job could not be restored")
             raise
+        finally:
+            for staged in (helper_stage, state_stage, plist_stage):
+                if staged is not None:
+                    staged.unlink(missing_ok=True)
     return label
 
 def run(root_value, digest):
     if not re.fullmatch(r"[0-9a-f]{20}", digest):
         fail("invalid managed id")
     root = safe_root(root_value)
-    for directory in (root / "state", root / "logs", root / "work", root / "work" / digest):
-        if directory.is_symlink() or not directory.is_dir() or directory.stat().st_uid != os.getuid() or stat.S_IMODE(directory.stat().st_mode) & 0o077:
+    work_dir = root / "work" / digest
+    for directory in (root / "state", root / "logs", root / "work", work_dir):
+        if (directory.is_symlink() or not directory.is_dir()
+                or directory.stat().st_uid != os.getuid()
+                or stat.S_IMODE(directory.stat().st_mode) & 0o077):
             fail("managed subdirectory is unsafe")
     state = root / "state" / (digest + ".json")
-    if state.is_symlink() or not state.is_file() or state.stat().st_uid != os.getuid() or stat.S_IMODE(state.stat().st_mode) & 0o077:
+    if (state.is_symlink() or not state.is_file() or state.stat().st_uid != os.getuid()
+            or stat.S_IMODE(state.stat().st_mode) & 0o077):
         fail("managed state is missing or unsafe")
     record = json.loads(state.read_text())
-    if record.get("owner") != "buzz-backend-ssh-v1" or record.get("label") != "local.buzz.ssh." + digest:
+    if (record.get("owner") != "buzz-backend-ssh-v1"
+            or record.get("label") != "local.buzz.ssh." + digest
+            or record.get("root") != str(root)):
         fail("managed state ownership mismatch")
+    env = record.get("env")
+    if not isinstance(env, dict) or any(not isinstance(k, str) or not isinstance(v, str)
+                                        for k, v in env.items()):
+        fail("managed environment is invalid")
+    expected = {
+        "HOME": work_dir / "home",
+        "XDG_CONFIG_HOME": work_dir / "config",
+        "XDG_CACHE_HOME": work_dir / "cache",
+        "XDG_DATA_HOME": work_dir / "data",
+        "BUZZ_AGENT_CONFIG_DIR": work_dir / "config" / "buzz-agent",
+        "CODEX_HOME": work_dir / "config" / "codex",
+        "CLAUDE_CONFIG_DIR": work_dir / "config" / "claude",
+        "TMPDIR": work_dir / "tmp",
+    }
+    for name, directory in expected.items():
+        if (env.get(name) != str(directory) or not directory.is_dir()
+                or directory.is_symlink() or directory.stat().st_uid != os.getuid()
+                or stat.S_IMODE(directory.stat().st_mode) & 0o077):
+            fail("managed environment is invalid")
+    runtime = record.get("runtime")
+    if not isinstance(runtime, str):
+        fail("managed runtime is invalid")
+    preflight_executable(runtime, env, "runtime_command")
     log_path = root / "logs" / (digest + ".log")
-    if log_path.is_symlink() or (log_path.exists() and (log_path.stat().st_uid != os.getuid() or stat.S_IMODE(log_path.stat().st_mode) & 0o077)):
+    if (log_path.is_symlink() or (log_path.exists()
+            and (log_path.stat().st_uid != os.getuid()
+                 or stat.S_IMODE(log_path.stat().st_mode) & 0o077))):
         fail("managed log is unsafe")
     fd = os.open(log_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW, 0o600)
     os.dup2(fd, 1)
     os.dup2(fd, 2)
     os.close(fd)
-    os.chdir(root / "work" / digest)
-    os.execve(record["runtime"], [record["runtime"]], {**os.environ, **record["env"]})
+    os.chdir(work_dir)
+    os.execve(runtime, [runtime], env)
 
 def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "run":
@@ -404,16 +639,29 @@ def respond(request):
         "remote project directory must exist and belong to the SSH user",
         "managed directory is not owned by the SSH user", "managed directory must have mode 0700",
         "managed directory cannot be a symlink", "managed subdirectory is unsafe",
-        "existing managed state is not private", "existing managed state is unreadable",
-        "existing managed state has a different owner", "managed path is a symlink",
+        "existing managed state is unreadable", "existing managed state has a different owner",
+        "existing managed files are not private", "existing managed files are incomplete",
+        "existing managed plist is unreadable", "existing managed plist has a different owner",
+        "existing immutable helper is unsafe", "managed path is a symlink",
         "existing launchd label is not owned by this provider",
         "managed lock is a symlink", "launchd GUI domain is unavailable",
         "agent is already running with different configuration; stop it before redeploy",
         "could not unload stopped managed job", "launchd could not bootstrap the managed job",
-        "launchd did not retain the managed job", "runtime_command is unavailable on the remote PATH",
+        "launchd did not retain the managed job", "managed runtime exited during startup",
+        "managed runtime did not become stably running",
+        "deployment failed and prior managed job could not be restored",
+        "remote PATH is unsafe", "runtime_command is unavailable on the remote PATH",
         "runtime_command is unavailable on the remote host",
+        "runtime_command has an invalid interpreter",
+        "runtime_command has an unsupported env interpreter",
+        "runtime_command interpreter is unavailable on the managed PATH",
+        "runtime_command interpreter is unavailable on the remote host",
         "launch.command is unavailable on the remote PATH",
         "launch.command must be a command name on the remote PATH",
+        "launch.command has an invalid interpreter",
+        "launch.command has an unsupported env interpreter",
+        "launch.command interpreter is unavailable on the managed PATH",
+        "launch.command interpreter is unavailable on the remote host",
         "runtime_command must be a command name on the remote PATH"
     }
     error = response.get("error")
