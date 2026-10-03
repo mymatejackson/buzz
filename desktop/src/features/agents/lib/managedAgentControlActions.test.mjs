@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  assertManagedAgentPrimaryStartAllowed,
+  getManagedAgentPrimaryActionState,
   startManagedAgentWithRules,
   respawnManagedAgentWithRules,
 } from "./managedAgentControlActions.ts";
@@ -40,6 +42,70 @@ function agent(overrides = {}) {
     ...overrides,
   };
 }
+
+test("provider primary action distinguishes receipt from relay liveness", () => {
+  const deployed = agent({
+    status: "deployed",
+    backend: { type: "provider", id: "ssh" },
+    backendAgentId: "owned-deployment",
+  });
+
+  assert.deepEqual(getManagedAgentPrimaryActionState(deployed, "online"), {
+    action: "stop",
+    label: "Shutdown",
+  });
+  assert.deepEqual(getManagedAgentPrimaryActionState(deployed, "away"), {
+    action: "stop",
+    label: "Shutdown",
+  });
+  assert.deepEqual(getManagedAgentPrimaryActionState(deployed, "offline"), {
+    action: "start",
+    label: "Start",
+  });
+
+  const unknown = getManagedAgentPrimaryActionState(deployed, undefined);
+  assert.equal(unknown.action, null);
+  assert.equal(unknown.label, "Availability unknown");
+  assert.match(unknown.blockReason, /Reconnect to the relay/);
+});
+
+test("provider without a receipt keeps deploy semantics and suppresses duplicates", () => {
+  const undeployed = agent({
+    backend: { type: "provider", id: "ssh" },
+  });
+
+  assert.deepEqual(getManagedAgentPrimaryActionState(undeployed, "offline"), {
+    action: "start",
+    label: "Deploy",
+    blockReason: undefined,
+  });
+  assert.doesNotThrow(() =>
+    assertManagedAgentPrimaryStartAllowed(undeployed, "offline"),
+  );
+  const present = getManagedAgentPrimaryActionState(undeployed, "online");
+  assert.equal(present.action, "start");
+  assert.equal(present.label, "Deploy");
+  assert.match(present.blockReason, /Starting another instance is unavailable/);
+  assert.throws(
+    () => assertManagedAgentPrimaryStartAllowed(undeployed, "online"),
+    /Starting another instance is unavailable/,
+  );
+});
+
+test("stopped local agents retain the positive-presence duplicate guard", () => {
+  const stopped = agent();
+  const present = getManagedAgentPrimaryActionState(stopped, "away");
+  assert.equal(present.action, "start");
+  assert.equal(present.label, "Start agent");
+  assert.match(present.blockReason, /Starting another instance is unavailable/);
+  assert.throws(
+    () => assertManagedAgentPrimaryStartAllowed(stopped, "away"),
+    /Starting another instance is unavailable/,
+  );
+  assert.doesNotThrow(() =>
+    assertManagedAgentPrimaryStartAllowed(stopped, "offline"),
+  );
+});
 
 test("relay-mesh agents delegate start to the backend preflight", async () => {
   const meshAgent = agent({

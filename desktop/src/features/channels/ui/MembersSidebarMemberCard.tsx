@@ -16,11 +16,12 @@ import {
 } from "lucide-react";
 
 import {
-  getManagedAgentPrimaryActionLabel,
+  getManagedAgentPrimaryActionState,
   isManagedAgentActive,
 } from "@/features/agents/lib/managedAgentControlActions";
 import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
+import { getPresenceLabel } from "@/features/presence/lib/presence";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
 import {
   agentCommunityAvailability,
@@ -227,16 +228,24 @@ export function MembersSidebarMemberCard({
                   ? agentCommunityAvailability(managedAgentRuntime) === "Here"
                     ? "default"
                     : "secondary"
-                  : managedAgent && isManagedAgentActive(managedAgent)
-                    ? "default"
-                    : "secondary"
+                  : managedAgent?.backend.type === "provider"
+                    ? presenceStatus === "online" || presenceStatus === "away"
+                      ? "default"
+                      : "secondary"
+                    : managedAgent && isManagedAgentActive(managedAgent)
+                      ? "default"
+                      : "secondary"
               }
             >
               {managedAgentRuntime
                 ? agentCommunityAvailability(managedAgentRuntime)
-                : managedAgent && isManagedAgentActive(managedAgent)
-                  ? "Running"
-                  : "Stopped"}
+                : managedAgent?.backend.type === "provider"
+                  ? presenceStatus
+                    ? getPresenceLabel(presenceStatus)
+                    : "Availability unknown"
+                  : managedAgent && isManagedAgentActive(managedAgent)
+                    ? "Running"
+                    : "Stopped"}
             </Badge>
             {managedAgent ? (
               <Badge
@@ -351,11 +360,13 @@ function MemberActionsMenu({
   const isBanned = moderationState?.banned ?? false;
   const isTimedOut = moderationState?.timedOut ?? false;
 
+  const primaryAction = managedAgent
+    ? getManagedAgentPrimaryActionState(managedAgent, availability)
+    : undefined;
   const startBlockReason = managedAgent
-    ? agentPresenceStartBlockReason(
-        pairAction ? pairAction === "stop" : isManagedAgentActive(managedAgent),
-        availability,
-      )
+    ? pairAction
+      ? agentPresenceStartBlockReason(pairAction === "stop", availability)
+      : primaryAction?.blockReason
     : undefined;
 
   return (
@@ -395,10 +406,10 @@ function MemberActionsMenu({
             >
               {pairAction
                 ? getPairActionIcon(pairAction)
-                : getManagedAgentActionIcon(managedAgent)}
+                : getManagedAgentActionIcon(managedAgent, availability)}
               {pairAction
                 ? MANAGED_AGENT_PAIR_ACTION_LABELS[pairAction]
-                : getManagedAgentPrimaryActionLabel(managedAgent)}
+                : primaryAction?.label}
             </DropdownMenuItem>
             {onEditRespondTo ? (
               <DropdownMenuItem
@@ -529,8 +540,12 @@ function getPairActionIcon(action: ManagedAgentPairAction) {
   return <Play className="h-4 w-4" />;
 }
 
-function getManagedAgentActionIcon(agent: ManagedAgent) {
-  if (isManagedAgentActive(agent)) {
+function getManagedAgentActionIcon(
+  agent: ManagedAgent,
+  availability: PresenceStatus | undefined,
+) {
+  const action = getManagedAgentPrimaryActionState(agent, availability).action;
+  if (action === "stop") {
     return <Square className="h-4 w-4" />;
   }
 

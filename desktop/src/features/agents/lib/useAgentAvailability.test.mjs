@@ -5,6 +5,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { resolveAgentAvailability } from "./useAgentAvailability.ts";
 import {
   getManagedAgentPrimaryActionLabel,
+  getManagedAgentPrimaryActionState,
   isManagedAgentActive,
 } from "./managedAgentControlActions.ts";
 import { AgentRuntimeAvatarControl } from "../ui/AgentRuntimeAvatarControl.tsx";
@@ -15,18 +16,29 @@ const deployed = {
   backendAgentId: "retained-receipt",
 };
 
-for (const presence of ["online", "away", "offline", undefined]) {
-  test(`retained deployment receipt does not supply availability (${presence})`, () => {
+for (const [presence, expectedAction, expectedLabel] of [
+  ["online", "stop", "Shutdown"],
+  ["away", "stop", "Shutdown"],
+  ["offline", "start", "Start"],
+  [undefined, "start", "Start"],
+]) {
+  test(`retained deployment receipt routes from established availability (${presence})`, () => {
     const availability = resolveAgentAvailability(presence, true, true);
     assert.equal(availability, presence ?? "offline");
-    // Controls retain their existing routing. Offline is not permission to
-    // spawn a second body, nor proof that a shutdown message succeeded.
     assert.equal(isManagedAgentActive(deployed), true);
-    assert.equal(getManagedAgentPrimaryActionLabel(deployed), "Shutdown");
+    const primaryAction = getManagedAgentPrimaryActionState(
+      deployed,
+      availability,
+    );
+    assert.equal(primaryAction.action, expectedAction);
+    assert.equal(
+      getManagedAgentPrimaryActionLabel(deployed, availability),
+      expectedLabel,
+    );
     const html = renderToStaticMarkup(
       createElement(AgentRuntimeAvatarControl, {
         activeTestId: "active",
-        isActive: true,
+        isActive: primaryAction.action !== "start",
         availability,
         isStarting: false,
         label: "Agent",
@@ -35,14 +47,17 @@ for (const presence of ["online", "away", "offline", undefined]) {
       }),
     );
     assert.doesNotMatch(html, /is running/);
-    assert.match(
-      html,
-      new RegExp(
-        `Agent: ${availability[0].toUpperCase()}${availability.slice(1)}`,
-      ),
-    );
-    assert.equal(html.includes("bg-emerald-500"), availability === "online");
-    assert.doesNotMatch(html, /data-testid="start"/);
+    if (expectedAction === "start") {
+      assert.match(html, /data-testid="start"/);
+    } else {
+      assert.match(
+        html,
+        new RegExp(
+          `Agent: ${availability[0].toUpperCase()}${availability.slice(1)}`,
+        ),
+      );
+      assert.doesNotMatch(html, /data-testid="start"/);
+    }
   });
 }
 
@@ -54,10 +69,17 @@ for (const [loaded, connected] of [
   test(`unavailable presence is unknown, not cached online (${loaded}, ${connected})`, () => {
     const availability = resolveAgentAvailability("online", loaded, connected);
     assert.equal(availability, undefined);
+    const primaryAction = getManagedAgentPrimaryActionState(
+      deployed,
+      availability,
+    );
+    assert.equal(primaryAction.action, null);
+    assert.equal(primaryAction.label, "Availability unknown");
+    assert.match(primaryAction.blockReason, /Reconnect to the relay/);
     const html = renderToStaticMarkup(
       createElement(AgentRuntimeAvatarControl, {
         activeTestId: "active",
-        isActive: true,
+        isActive: primaryAction.action !== "start",
         availability,
         isStarting: false,
         label: "Agent",
@@ -75,7 +97,7 @@ for (const lifecycle of ["running", "stopped"]) {
     const agent = { status: lifecycle, backend: { type: "local" } };
     const isActive = isManagedAgentActive(agent);
     assert.equal(
-      getManagedAgentPrimaryActionLabel(agent),
+      getManagedAgentPrimaryActionLabel(agent, undefined),
       isActive ? "Stop" : "Start agent",
     );
     const html = renderToStaticMarkup(

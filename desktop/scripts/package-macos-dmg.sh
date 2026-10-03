@@ -37,6 +37,12 @@ trap finish EXIT
 [[ -d "$app_path" ]] || { echo "App bundle not found: $app_path" >&2; exit 1; }
 [[ -f "$background" ]] || { echo "DMG background not found: $background" >&2; exit 1; }
 
+entitlements="$script_dir/../src-tauri/Entitlements.plist"
+verifier="$script_dir/verify-macos-entitlements.sh"
+[[ -f "$entitlements" ]] || { echo "Entitlements not found: $entitlements" >&2; exit 1; }
+codesign --force --deep --sign - --entitlements "$entitlements" "$app_path"
+"$verifier" "$app_path"
+
 mkdir -p "$(dirname "$out_dmg")" "$source_dir/.background" "$mount_point"
 ditto "$app_path" "$source_dir/$app_name"
 ln -s /Applications "$source_dir/Applications"

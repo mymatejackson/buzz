@@ -18,7 +18,8 @@ export function resolveAgentAvailability(
 }
 
 /** Positive presence blocks another start, but never grants lifecycle control.
- * Missing/offline presence is not proof that starting another body is safe.
+ * Offline alone is not proof that starting another body is safe; the provider
+ * primary-action exception also requires a retained owned deployment receipt.
  */
 export function agentPresenceStartBlockReason(
   isLifecycleActive: boolean,

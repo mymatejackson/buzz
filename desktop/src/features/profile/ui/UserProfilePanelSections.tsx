@@ -4,11 +4,7 @@ import { ChevronDown, ChevronUp, Pencil } from "lucide-react";
 import { OtherSetupAgentMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
 import { useIsOtherSetupAgent } from "@/features/agents/useKnownAgentPubkeys";
 import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
-import { agentPresenceStartBlockReason } from "@/features/agents/lib/useAgentAvailability";
-import {
-  getManagedAgentPrimaryActionLabel,
-  isManagedAgentActive,
-} from "@/features/agents/lib/managedAgentControlActions";
+import { getManagedAgentPrimaryActionState } from "@/features/agents/lib/managedAgentControlActions";
 import { RestartDiffBadge } from "@/features/agents/ui/RestartDiffBadge";
 import { AgentConfigPanel } from "@/features/agents/ui/AgentConfigPanel";
 import type { IdentityArchiveActions } from "@/features/identity-archive/hooks";
@@ -427,20 +423,21 @@ export function ProfileSummaryView({
           agentActionDisabled={isAgentActionPending}
           agentStartBlockReason={
             managedAgent
-              ? agentPresenceStartBlockReason(
-                  isManagedAgentActive(managedAgent),
-                  presenceStatus,
-                )
+              ? getManagedAgentPrimaryActionState(managedAgent, presenceStatus)
+                  .blockReason
               : undefined
           }
           agentActionLabel={
             isOwner === true && managedAgent
-              ? getManagedAgentPrimaryActionLabel(managedAgent)
+              ? getManagedAgentPrimaryActionState(managedAgent, presenceStatus)
+                  .label
               : undefined
           }
           agentActionLive={
-            managedAgent?.status === "running" ||
-            managedAgent?.status === "deployed"
+            managedAgent
+              ? getManagedAgentPrimaryActionState(managedAgent, presenceStatus)
+                  .action === "stop"
+              : false
           }
           onAgentPrimaryAction={
             isOwner === true && managedAgent

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 
 import {
   demoBuildConfig,
@@ -24,6 +25,19 @@ const expected = (name, slug) => ({
     plugins: { "deep-link": { desktop: { schemes: [`buzz-demo-${slug}`] } } },
     bundle: { targets: ["app"] },
   },
+});
+
+test("demo packaging preserves and verifies macOS entitlements", () => {
+  const packager = readFileSync(
+    new URL("./package-macos-dmg.sh", import.meta.url),
+    "utf8",
+  );
+  const signCommand =
+    'codesign --force --deep --sign - --entitlements "$entitlements" "$app_path"';
+  const verifyCommand = '"$verifier" "$app_path"';
+
+  assert.ok(packager.includes(signCommand));
+  assert.ok(packager.indexOf(verifyCommand) > packager.indexOf(signCommand));
 });
 
 test("production identity remains unchanged", () => {

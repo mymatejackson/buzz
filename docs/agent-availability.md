@@ -17,10 +17,13 @@ query errors reject the IPC call rather than fabricating an empty snapshot.
 A live update or self heartbeat cannot heal a failed aggregate snapshot by
 marking cached siblings successful; those reads remain unknown until a
 successful snapshot retry. No per-row polling is needed, and
-there is no second availability cache or substrate poller. Lifecycle controls
-remain separate: a deployed provider agent still offers Shutdown while offline.
-Shutdown sends a request, not a confirmed termination, and absence of presence
-is not permission to deploy a duplicate body. Local Stop/Start routing is unchanged.
+there is no second availability cache or substrate poller. Lifecycle authority
+remains separate from presence. For a provider agent with a retained deployment
+receipt, the receipt proves the owned routing target while relay availability
+selects the primary action: Online/Away offers request-only Shutdown, established
+Offline offers idempotent Start/redeploy, and unknown is disabled with an
+explicit reconnect explanation. Presence without a receipt never grants Stop.
+Local Stop/Start routing is unchanged.
 
 A locally stopped record with current exact-key Online or Away presence does
 not establish local process ownership. Its card replaces Start (including a
@@ -49,6 +52,14 @@ A successful cached snapshot remains usable during an in-flight background
 refetch under the existing query policy; a settled error revokes it even though
 TanStack retains the old data. A live single-author update cannot heal a failed
 aggregate. This is not a new freshness cache or a distributed lock.
+
+For the primary action of a provider agent with a deployment receipt:
+
+| Availability | Primary action |
+| --- | --- |
+| Online or Away | Shutdown request. |
+| Established Offline | Start/redeploy through the idempotent, ownership-checked provider deploy path. |
+| Unknown | Disabled “Availability unknown” state until relay availability can be established. |
 
 For deletion of a provider agent with a deployment receipt:
 
@@ -85,8 +96,9 @@ same per-instance rules, treating unqueried siblings as unknown.
 
 - `desktop/src/features/agents/lib/useAgentAvailability.test.mjs`: successful,
   missing, unavailable, and disconnected presence; lifecycle routing and badges.
-- `desktop/tests/e2e/agent-availability.spec.ts`: deployed/offline profile and
-  card, stopped/Online and Away presence, disabled keyboard/click Start in
+- `desktop/tests/e2e/agent-availability.spec.ts`: deployed provider action
+  routing across Online/Away/Offline/unknown, stopped/Online and Away presence,
+  disabled keyboard/click Start in
   profile and member menu, restored Offline startup, running-but-Offline,
   live updates and disconnected-state behavior. Its real hover-popover journey
   holds the single-key IPC read pending, then distinguishes successful omission

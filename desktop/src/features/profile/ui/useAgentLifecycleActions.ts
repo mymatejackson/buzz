@@ -2,6 +2,7 @@ import * as React from "react";
 import { toast } from "sonner";
 
 import {
+  getManagedAgentPrimaryActionState,
   isManagedAgentActive,
   respawnManagedAgentWithRules,
   startManagedAgentWithRules,
@@ -35,7 +36,18 @@ export function useAgentLifecycleActions({
     if (!managedAgent) return;
 
     try {
-      if (isManagedAgentActive(managedAgent)) {
+      const primaryAction = getManagedAgentPrimaryActionState(
+        managedAgent,
+        availability,
+      );
+      if (primaryAction.blockReason) {
+        throw new Error(primaryAction.blockReason);
+      }
+      if (primaryAction.action === null) {
+        throw new Error("Agent availability is unknown.");
+      }
+
+      if (primaryAction.action === "stop") {
         const result = await stopManagedAgentWithRules({
           agent: managedAgent,
           channels: channels ?? [],
@@ -49,15 +61,15 @@ export function useAgentLifecycleActions({
         return;
       }
 
-      const blockReason = agentPresenceStartBlockReason(false, availability);
-      if (blockReason) throw new Error(blockReason);
       await startManagedAgentWithRules({
         agent: managedAgent,
         startManagedAgent,
       });
       toast.success(
         managedAgent.backend.type === "provider"
-          ? `Deploying ${managedAgent.name}.`
+          ? primaryAction.label === "Start"
+            ? `Starting ${managedAgent.name}.`
+            : `Deploying ${managedAgent.name}.`
           : `Started ${managedAgent.name}.`,
       );
     } catch (error) {

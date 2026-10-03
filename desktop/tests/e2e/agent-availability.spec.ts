@@ -4,7 +4,7 @@ import { waitForAnimations } from "../helpers/animations";
 
 const LOCAL = "d".repeat(64);
 
-test("saved deployment with offline presence is not shown as online", async ({
+test("saved provider deployment routes actions from relay availability", async ({
   page,
 }, testInfo) => {
   await installMockBridge(page, {
@@ -20,11 +20,9 @@ test("saved deployment with offline presence is not shown as online", async ({
   });
   await page.goto("/#/agents");
   const dot = page.getByTestId(`agent-runtime-active-${LOCAL}`);
-  await expect(dot).toHaveAttribute(
-    "aria-label",
-    "Offline deployment: Offline",
-  );
-  await expect(dot.locator("xpath=../..")).not.toHaveClass(/bg-emerald-500/);
+  const start = page.getByTestId(`agent-runtime-start-${LOCAL}`);
+  await expect(dot).toHaveCount(0);
+  await expect(start).toHaveAttribute("aria-label", "Start Agent");
   await page
     .getByRole("button", { name: "Offline deployment agent profile" })
     .click();
@@ -32,10 +30,44 @@ test("saved deployment with offline presence is not shown as online", async ({
     "aria-label",
     "Offline",
   );
-  // Preserve the existing request-only lifecycle control; no inferred redeploy.
-  await expect(
-    page.getByTestId("user-profile-agent-primary-action"),
-  ).toHaveAttribute("aria-label", "Shutdown");
+  const primaryAction = page.getByTestId("user-profile-agent-primary-action");
+  await expect(primaryAction).toHaveAttribute("aria-label", "Start");
+  await primaryAction.click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window.__BUZZ_E2E_COMMANDS__ ?? []).filter(
+            (command) => command === "start_managed_agent",
+          ).length,
+      ),
+    )
+    .toBe(1);
+  expect(
+    await page.evaluate(() =>
+      (window.__BUZZ_E2E_COMMANDS__ ?? []).filter(
+        (command) => command === "stop_managed_agent",
+      ),
+    ),
+  ).toEqual([]);
+  expect(
+    await page.evaluate(async (pubkey) => {
+      const rows = (await window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__?.(
+        "list_managed_agents",
+      )) as
+        | Array<{
+            pubkey: string;
+            status: string;
+            backend_agent_id: string | null;
+          }>
+        | undefined;
+      return rows?.find((row) => row.pubkey === pubkey);
+    }, LOCAL),
+  ).toMatchObject({
+    pubkey: LOCAL,
+    status: "deployed",
+    backend_agent_id: `mock-provider-${LOCAL.slice(0, 12)}`,
+  });
   await waitForAnimations(page);
   await page
     .getByTestId("user-profile-panel")
@@ -63,13 +95,20 @@ test("saved deployment with offline presence is not shown as online", async ({
     await expect(
       page.getByTestId("user-profile-presence-badge"),
     ).toHaveAttribute("aria-label", status[0].toUpperCase() + status.slice(1));
-    await expect(dot).toHaveAttribute(
-      "aria-label",
-      `Offline deployment: ${status[0].toUpperCase() + status.slice(1)}`,
-    );
+    const expectedAction = status === "offline" ? "Start" : "Shutdown";
     await expect(
       page.getByTestId("user-profile-agent-primary-action"),
-    ).toHaveAttribute("aria-label", "Shutdown");
+    ).toHaveAttribute("aria-label", expectedAction);
+    if (status === "offline") {
+      await expect(dot).toHaveCount(0);
+      await expect(start).toHaveAttribute("aria-label", "Start Agent");
+    } else {
+      await expect(dot).toHaveAttribute(
+        "aria-label",
+        `Offline deployment: ${status[0].toUpperCase() + status.slice(1)}`,
+      );
+      await expect(start).toHaveCount(0);
+    }
     if (status === "online") {
       await waitForAnimations(page);
       await page
@@ -82,19 +121,13 @@ test("saved deployment with offline presence is not shown as online", async ({
             "Shutdown requested. This does not confirm the agent has stopped.",
         }),
       ).toBeVisible();
-      await expect(
-        page.getByTestId("user-profile-presence-badge"),
-      ).toHaveAttribute("aria-label", "Online");
-      await expect(
-        page.getByTestId("user-profile-agent-primary-action"),
-      ).toHaveAttribute("aria-label", "Shutdown");
       expect(
         await page.evaluate(() =>
           (window.__BUZZ_E2E_COMMANDS__ ?? []).filter((command) =>
             ["start_managed_agent", "stop_managed_agent"].includes(command),
           ),
         ),
-      ).toEqual([]);
+      ).toEqual(["start_managed_agent"]);
     }
   }
   await page.evaluate(() =>
@@ -105,6 +138,12 @@ test("saved deployment with offline presence is not shown as online", async ({
     "aria-label",
     "Offline deployment: Availability unknown",
   );
+  await expect(
+    page.getByTestId("user-profile-agent-primary-action"),
+  ).toBeDisabled();
+  await expect(
+    page.getByTestId("user-profile-agent-primary-action"),
+  ).toHaveAttribute("aria-label", "Availability unknown");
 });
 
 test("missing snapshot is offline but failed reads cannot reuse cached online", async ({
@@ -347,6 +386,70 @@ test("member menu cannot start a present stopped local runtime", async ({
       ),
     )
     .toBe(1);
+});
+
+test("member menu starts one retained offline provider deployment", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    managedAgents: [
+      {
+        pubkey: LOCAL,
+        name: "Offline provider member",
+        status: "deployed",
+        backend: { type: "provider", id: "fixture", config: {} },
+        channelNames: ["agents"],
+      },
+    ],
+  });
+  await page.goto("/");
+  await page.getByTestId("channel-agents").click();
+  await page.getByTestId("channel-members-trigger").click();
+  const row = page.getByTestId(`sidebar-member-${LOCAL}`);
+  await expect(row).toBeVisible();
+  await row.hover();
+  const menu = page.getByTestId(`sidebar-member-menu-${LOCAL}`);
+  await menu.focus();
+  await menu.press("Enter");
+  const action = page.getByTestId(`sidebar-agent-action-${LOCAL}`);
+  await expect(action).toContainText("Start");
+  await expect(action).not.toHaveAttribute("aria-disabled", "true");
+  await action.click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window.__BUZZ_E2E_COMMANDS__ ?? []).filter(
+            (command) => command === "start_managed_agent",
+          ).length,
+      ),
+    )
+    .toBe(1);
+  expect(
+    await page.evaluate(() =>
+      (window.__BUZZ_E2E_COMMANDS__ ?? []).filter(
+        (command) => command === "stop_managed_agent",
+      ),
+    ),
+  ).toEqual([]);
+  expect(
+    await page.evaluate(async (pubkey) => {
+      const rows = (await window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__?.(
+        "list_managed_agents",
+      )) as
+        | Array<{
+            pubkey: string;
+            status: string;
+            backend_agent_id: string | null;
+          }>
+        | undefined;
+      return rows?.find((candidate) => candidate.pubkey === pubkey);
+    }, LOCAL),
+  ).toMatchObject({
+    pubkey: LOCAL,
+    status: "deployed",
+    backend_agent_id: `mock-provider-${LOCAL.slice(0, 12)}`,
+  });
 });
 
 for (const surface of ["agents", "members"] as const) {

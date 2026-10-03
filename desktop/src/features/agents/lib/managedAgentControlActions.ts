@@ -1,6 +1,14 @@
 import { sendChannelMessage } from "@/shared/api/tauri";
-import type { Channel, ManagedAgent, RelayAgent } from "@/shared/api/types";
-import type { AgentAvailabilityReader } from "./useAgentAvailability";
+import type {
+  Channel,
+  ManagedAgent,
+  PresenceStatus,
+  RelayAgent,
+} from "@/shared/api/types";
+import {
+  agentPresenceStartBlockReason,
+  type AgentAvailabilityReader,
+} from "./useAgentAvailability";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 type DeleteManagedAgentInput = {
@@ -32,16 +40,74 @@ export function isManagedAgentActive(agent: Pick<ManagedAgent, "status">) {
   return agent.status === "running" || agent.status === "deployed";
 }
 
-export function getManagedAgentPrimaryActionLabel(agent: ManagedAgent) {
-  if (agent.backend.type === "provider") {
-    return isManagedAgentActive(agent) ? "Shutdown" : "Deploy";
+export type ManagedAgentPrimaryActionState = {
+  action: "start" | "stop" | null;
+  blockReason?: string;
+  label: string;
+};
+
+const UNKNOWN_PROVIDER_AVAILABILITY_REASON =
+  "Agent availability is unknown. Reconnect to the relay before controlling this deployment.";
+
+/** Resolve the primary lifecycle action without treating a retained provider
+ * deployment receipt as proof that a remote process is alive.
+ */
+export function getManagedAgentPrimaryActionState(
+  agent: ManagedAgent,
+  availability: PresenceStatus | undefined,
+): ManagedAgentPrimaryActionState {
+  if (agent.backend?.type !== "provider") {
+    return isManagedAgentActive(agent)
+      ? { action: "stop", label: "Stop" }
+      : {
+          action: "start",
+          label: "Start agent",
+          blockReason: agentPresenceStartBlockReason(false, availability),
+        };
   }
 
-  if (isManagedAgentActive(agent)) {
-    return "Stop";
+  const hasDeploymentReceipt =
+    agent.status === "deployed" || Boolean(agent.backendAgentId);
+  if (!hasDeploymentReceipt) {
+    return {
+      action: "start",
+      label: "Deploy",
+      blockReason: agentPresenceStartBlockReason(false, availability),
+    };
   }
 
-  return "Start agent";
+  if (availability === "online" || availability === "away") {
+    return { action: "stop", label: "Shutdown" };
+  }
+  if (availability === "offline") {
+    return { action: "start", label: "Start" };
+  }
+
+  return {
+    action: null,
+    label: "Availability unknown",
+    blockReason: UNKNOWN_PROVIDER_AVAILABILITY_REASON,
+  };
+}
+
+export function getManagedAgentPrimaryActionLabel(
+  agent: ManagedAgent,
+  availability: PresenceStatus | undefined,
+) {
+  return getManagedAgentPrimaryActionState(agent, availability).label;
+}
+
+export function assertManagedAgentPrimaryStartAllowed(
+  agent: ManagedAgent,
+  availability: PresenceStatus | undefined,
+) {
+  const state = getManagedAgentPrimaryActionState(agent, availability);
+  if (state.blockReason) {
+    throw new Error(state.blockReason);
+  }
+  if (state.action !== "start") {
+    throw new Error("This agent cannot be started in its current state.");
+  }
 }
 
 export function resolveManagedAgentChannelId(

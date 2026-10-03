@@ -25,7 +25,9 @@ import type { AgentPersona, Channel, ManagedAgent } from "@/shared/api/types";
 import { removeChannelMember } from "@/shared/api/tauri";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import {
+  assertManagedAgentPrimaryStartAllowed,
   deleteManagedAgentWithRules,
+  getManagedAgentPrimaryActionState,
   isManagedAgentActive,
   respawnManagedAgentWithRules,
   startManagedAgentWithRules,
@@ -107,14 +109,6 @@ export function useManagedAgentActions() {
   const { query: managedPresenceQuery, getAvailability } =
     useAgentAvailabilityLookup(managedPubkeyList);
 
-  function assertStartNotBlockedByPresence(agent: ManagedAgent) {
-    const reason = agentPresenceStartBlockReason(
-      isManagedAgentActive(agent),
-      getAvailability(agent.pubkey),
-    );
-    if (reason) throw new Error(reason);
-  }
-
   const channelsByPubkey = React.useMemo(() => {
     const map: Record<string, { id: string; name: string }[]> = {};
     // Seed from relay agent profiles (kind:10100 events).
@@ -176,7 +170,10 @@ export function useManagedAgentActions() {
     try {
       const agent = managedAgents.find((c) => c.pubkey === pubkey);
       if (!agent) return;
-      assertStartNotBlockedByPresence(agent);
+      assertManagedAgentPrimaryStartAllowed(
+        agent,
+        getAvailability(agent.pubkey),
+      );
       await startManagedAgentWithRules({
         agent,
         startManagedAgent: startMutation.mutateAsync,
@@ -197,7 +194,11 @@ export function useManagedAgentActions() {
         (candidate) => candidate.pubkey === pubkey,
       );
       if (!agent) return;
-      assertStartNotBlockedByPresence(agent);
+      const blockReason = agentPresenceStartBlockReason(
+        isManagedAgentActive(agent),
+        getAvailability(agent.pubkey),
+      );
+      if (blockReason) throw new Error(blockReason);
       await respawnManagedAgentWithRules({
         agent,
         startManagedAgent: startMutation.mutateAsync,
@@ -409,7 +410,13 @@ export function useManagedAgentActions() {
 
   async function handleBulkStopRunning() {
     await runBulkAction(
-      managedAgents.filter((a) => isManagedAgentActive(a)),
+      managedAgents.filter(
+        (agent) =>
+          getManagedAgentPrimaryActionState(
+            agent,
+            getAvailability(agent.pubkey),
+          ).action === "stop",
+      ),
       "Stop",
       "stop",
       async (a) => {

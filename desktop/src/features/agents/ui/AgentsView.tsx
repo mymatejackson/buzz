@@ -25,7 +25,7 @@ import { usePersonaActions } from "./usePersonaActions";
 import { useTeamActions } from "./useTeamActions";
 import { useProfilePanel } from "@/shared/context/ProfilePanelContext";
 import { useBakedBuildEnvQuery } from "@/features/agents/hooks";
-import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
+import { getManagedAgentPrimaryActionState } from "@/features/agents/lib/managedAgentControlActions";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { Button } from "@/shared/ui/button";
 import {
@@ -97,8 +97,12 @@ export function AgentsView() {
     teamActions.createTeamMutation.isPending ||
     teamActions.updateTeamMutation.isPending ||
     teamActions.deleteTeamMutation.isPending;
-  const runningAgentCount = agents.managedAgents.filter((agent) =>
-    isManagedAgentActive(agent),
+  const runningAgentCount = agents.managedAgents.filter(
+    (agent) =>
+      getManagedAgentPrimaryActionState(
+        agent,
+        agents.getAvailability(agent.pubkey),
+      ).action === "stop",
   ).length;
   const hasSavedAgentDefaults = Boolean(
     globalConfig.preferred_runtime?.trim() ||

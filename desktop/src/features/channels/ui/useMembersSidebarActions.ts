@@ -10,6 +10,7 @@ import {
   useStopManagedAgentMutation,
 } from "@/features/agents/hooks";
 import {
+  getManagedAgentPrimaryActionState,
   respawnManagedAgentWithRules,
   isManagedAgentActive,
   startManagedAgentWithRules,
@@ -88,8 +89,14 @@ export function useMembersSidebarActions({
 
   const stoppableManagedBots = React.useMemo(
     () =>
-      controllableManagedBots.filter((agent) => isManagedAgentActive(agent)),
-    [controllableManagedBots],
+      controllableManagedBots.filter(
+        (agent) =>
+          getManagedAgentPrimaryActionState(
+            agent,
+            getAvailability(agent.pubkey),
+          ).action === "stop",
+      ),
+    [controllableManagedBots, getAvailability],
   );
 
   const isActionPending =
@@ -187,7 +194,18 @@ export function useMembersSidebarActions({
         return;
       }
 
-      if (isManagedAgentActive(agent)) {
+      const primaryAction = getManagedAgentPrimaryActionState(
+        agent,
+        getAvailability(agent.pubkey),
+      );
+      if (primaryAction.blockReason) {
+        throw new Error(primaryAction.blockReason);
+      }
+      if (primaryAction.action === null) {
+        throw new Error("Agent availability is unknown.");
+      }
+
+      if (primaryAction.action === "stop") {
         await stopManagedAgentWithRules({
           agent,
           ...EMPTY_AGENT_CONTEXT,
@@ -205,7 +223,6 @@ export function useMembersSidebarActions({
         return;
       }
 
-      assertStartNotBlockedByPresence(agent, false);
       await startManagedAgentWithRules({
         agent,
         startManagedAgent: startManagedAgentMutation.mutateAsync,
@@ -340,7 +357,9 @@ export function useMembersSidebarActions({
 
 function getLifecycleSuccessMessage(agent: ManagedAgent) {
   if (agent.backend.type === "provider") {
-    return `Deployed ${agent.name}.`;
+    return agent.status === "deployed" || agent.backendAgentId
+      ? `Started ${agent.name}.`
+      : `Deployed ${agent.name}.`;
   }
 
   return agent.status === "stopped"
